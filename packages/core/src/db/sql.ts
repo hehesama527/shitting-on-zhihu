@@ -825,6 +825,8 @@ export async function applySchemaMigrations(pool: Pool) {
     }
   }
 
+  await dedupeAnsweredTopicsBeforeUniqueIndex(pool);
+
   for (const migration of addIndexMigrations) {
     if (!(await hasIndex(pool, migration.table, migration.index))) {
       await pool.query(migration.ddl);
@@ -832,6 +834,22 @@ export async function applySchemaMigrations(pool: Pool) {
   }
 
   await backfillAnsweredTopics(pool);
+}
+
+async function dedupeAnsweredTopicsBeforeUniqueIndex(pool: Pool) {
+  await pool.query(
+    `DELETE older
+     FROM answered_topics older
+     JOIN answered_topics newer
+       ON newer.account_id IS NOT NULL
+      AND older.account_id = newer.account_id
+      AND older.question_url_hash = newer.question_url_hash
+      AND (
+        newer.answered_at > older.answered_at
+        OR (newer.answered_at = older.answered_at AND newer.id > older.id)
+      )
+     WHERE older.account_id IS NOT NULL`
+  );
 }
 
 async function hasIndex(pool: Pool, table: string, index: string) {

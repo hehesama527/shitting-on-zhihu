@@ -120,6 +120,7 @@ export class PublishService {
     resumeAnchor?: PublishResumeAnchor | null;
     expectedZhihuUserName?: string | null;
     accountName?: string | null;
+    onSubmitClicked?: (clickedAt: string) => Promise<void> | void;
   }) {
     const traceBase = {
       sessionKey: input.sessionKey,
@@ -417,7 +418,8 @@ export class PublishService {
       traceBase,
       snapshot: afterPasteSnapshot,
       content: richTextPayload.plainText,
-      promptSnapshot: input.promptSnapshot
+      promptSnapshot: input.promptSnapshot,
+      onSubmitClicked: input.onSubmitClicked
     });
   }
 
@@ -438,6 +440,7 @@ export class PublishService {
     snapshot: PageSnapshot;
     content: string;
     promptSnapshot?: PromptSnapshotMap | null;
+    onSubmitClicked?: (clickedAt: string) => Promise<void> | void;
   }) {
     let snapshot = input.snapshot;
     let lastPlan: PublishStepPlan | null = null;
@@ -473,6 +476,12 @@ export class PublishService {
 
       const clicked = await this.trySubmitClick(input.traceBase, lastPlan);
       if (clicked) {
+        const clickedAt = new Date().toISOString();
+        try {
+          await input.onSubmitClicked?.(clickedAt);
+        } catch (error) {
+          console.warn("[PublishService] failed to persist submit-click marker", error);
+        }
         recoveryTrace.push(`step_${step}:click_submit`);
         await this.browserSkillService.wait({ ...input.traceBase, stage: "publish_verify" }, { ms: 3500 });
         try {
@@ -681,6 +690,7 @@ export class PublishService {
     publishJobId: number;
     publishAttemptId: number | null;
     currentUrl: string;
+    questionUrl?: string | null;
     content: string;
     promptSnapshot?: PromptSnapshotMap | null;
     expectedZhihuUserName?: string | null;
@@ -707,39 +717,69 @@ export class PublishService {
       accountName: input.accountName ?? null
     });
 
-    await this.browserSkillService.open(
-      {
-        ...traceBase,
-        stage: "publish_verify"
-      },
-      {
-        url: input.currentUrl
-      }
-    );
+    const candidateUrls = uniqueHttpUrls([
+      input.currentUrl,
+      input.questionUrl ?? null,
+      "https://www.zhihu.com/creator/answers",
+      "https://www.zhihu.com/creator/content-management"
+    ]);
+    let lastResult: {
+      reviewedResult: { decision: "SUCCESS" | "CONTENT_RISK" | "UNCERTAIN"; reason: string };
+      currentUrl: string;
+      screenshotPath: string;
+    } | null = null;
 
-    await this.browserSkillService.wait(
-      {
-        ...traceBase,
-        stage: "publish_verify"
-      },
-      {
-        ms: 1800
-      }
-    );
+    for (const candidateUrl of candidateUrls) {
+      try {
+        await this.browserSkillService.open(
+          {
+            ...traceBase,
+            stage: "publish_verify"
+          },
+          {
+            url: candidateUrl
+          }
+        );
 
-    const reviewedPage = await this.captureAndReviewPageResult({
-      traceBase,
-      stage: "publish_verify",
-      content: input.content,
-      promptSnapshot: input.promptSnapshot,
-      screenshotLabel: `publish-verify-${input.publishJobId}`
-    });
+        await this.browserSkillService.wait(
+          {
+            ...traceBase,
+            stage: "publish_verify"
+          },
+          {
+            ms: 1800
+          }
+        );
+
+        const reviewedPage = await this.captureAndReviewPageResult({
+          traceBase,
+          stage: "publish_verify",
+          content: input.content,
+          promptSnapshot: input.promptSnapshot,
+          screenshotLabel: `publish-verify-${input.publishJobId}`
+        });
+        lastResult = reviewedPage;
+
+        if (reviewedPage.reviewedResult.decision === "SUCCESS" || reviewedPage.reviewedResult.decision === "CONTENT_RISK") {
+          break;
+        }
+      } catch (error) {
+        lastResult = {
+          reviewedResult: {
+            decision: "UNCERTAIN",
+            reason: error instanceof Error ? error.message : "验证入口打开失败。"
+          },
+          currentUrl: candidateUrl,
+          screenshotPath: ""
+        };
+      }
+    }
 
     return {
-      ok: reviewedPage.reviewedResult.decision === "SUCCESS",
-      reason: reviewedPage.reviewedResult.reason,
-      finalUrl: reviewedPage.currentUrl,
-      screenshotPath: reviewedPage.screenshotPath
+      ok: lastResult?.reviewedResult.decision === "SUCCESS",
+      reason: lastResult?.reviewedResult.reason ?? "没有可用的发布结果验证入口。",
+      finalUrl: lastResult?.currentUrl ?? input.currentUrl,
+      screenshotPath: lastResult?.screenshotPath ?? ""
     };
   }
 
@@ -1013,12 +1053,18 @@ export class PublishService {
         expectedExcerpt: contentSignals.expectedExcerpt
       });
       if (layaReview && layaReview.decision !== "UNCERTAIN") {
-        return {
-          decision: layaReview.decision,
-          confidence: layaReview.confidence,
-          matchedSignals: mergeMatchedSignals(layaReview.matchedSignals, initialMatchedSignals),
-          reason: layaReview.reason
-        };
+        const layaMatchedSignals = mergeMatchedSignals(layaReview.matchedSignals, initialMatchedSignals);
+        const layaSuccessHasStrongEvidence =
+          layaReview.decision !== "SUCCESS" ||
+          (!initialEditorStillVisible && isAnswerDetailUrl(currentUrl) && layaMatchedSignals.length > 0);
+        if (layaSuccessHasStrongEvidence) {
+          return {
+            decision: layaReview.decision,
+            confidence: layaReview.confidence,
+            matchedSignals: layaMatchedSignals,
+            reason: layaReview.reason
+          };
+        }
       }
     } catch {
       // 异常自动平滑降级至下方的 LLM 兜底
@@ -1903,6 +1949,10 @@ function hasSubmitSemantic(snapshot: PageSnapshot) {
 
 function isAnswerDetailUrl(url: string) {
   return /\/answer\/\d+/i.test(url);
+}
+
+function uniqueHttpUrls(urls: Array<string | null | undefined>) {
+  return [...new Set(urls.filter((url): url is string => Boolean(url && /^https?:\/\//i.test(url))))];
 }
 
 function findFirstMatchingText(values: string[], candidates: string[]) {

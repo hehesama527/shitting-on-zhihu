@@ -123,6 +123,7 @@ type StaleRunningAttemptRow = RowDataPacket & {
 };
 
 type JobUpdateOptions = {
+  leaseOwner?: string | null;
   failureReason?: string | null;
   finalUrl?: string | null;
   currentStage?: JobStage | null;
@@ -237,6 +238,7 @@ export class JobRepository {
       reviewId: number;
       title: string;
       promptVersionSnapshotJson: string | null;
+      leaseOwner?: string | null;
     }
   ) {
     await this.pool.query(
@@ -251,8 +253,21 @@ export class JobRepository {
            current_stage = 'review_passed',
            resume_anchor_json = NULL,
            last_error_type = NULL
-       WHERE id = ?`,
-      [input.topicCardId, input.reviewId, input.title, input.promptVersionSnapshotJson, jobId]
+       WHERE id = ?
+         AND (
+           (? IS NOT NULL AND lease_owner = ? AND lease_until >= NOW())
+           OR (? IS NULL AND (lease_owner IS NULL OR lease_until < NOW()))
+         )`,
+      [
+        input.topicCardId,
+        input.reviewId,
+        input.title,
+        input.promptVersionSnapshotJson,
+        jobId,
+        input.leaseOwner ?? null,
+        input.leaseOwner ?? null,
+        input.leaseOwner ?? null
+      ]
     );
   }
 
@@ -264,6 +279,7 @@ export class JobRepository {
   }
 
   async updateJobStatus(jobId: number, status: JobStatus, options?: JobUpdateOptions) {
+    const leaseOwner = options?.leaseOwner ?? null;
     const hasFailureReason = options ? Object.prototype.hasOwnProperty.call(options, "failureReason") : false;
     const hasFinalUrl = options ? Object.prototype.hasOwnProperty.call(options, "finalUrl") : false;
     const hasCurrentStage = options ? Object.prototype.hasOwnProperty.call(options, "currentStage") : false;
@@ -288,8 +304,12 @@ export class JobRepository {
            last_error_type = CASE WHEN ? THEN ? ELSE last_error_type END,
            started_at = CASE WHEN ? = 'publishing' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END,
            finished_at = CASE WHEN ? IN ('published', 'failed_terminal') THEN CURRENT_TIMESTAMP ELSE finished_at END
-       WHERE id = ?
-         AND status NOT IN ('published', 'failed_terminal')`,
+        WHERE id = ?
+          AND status NOT IN ('published', 'failed_terminal')
+          AND (
+            (? IS NOT NULL AND lease_owner = ? AND lease_until >= NOW())
+            OR (? IS NULL AND (lease_owner IS NULL OR lease_until < NOW()))
+          )`,
       [
         status,
         hasFailureReason ? 1 : 0,
@@ -310,9 +330,12 @@ export class JobRepository {
         options?.lastTraceId ?? null,
         hasLastErrorType ? 1 : 0,
         options?.lastErrorType ?? null,
-        status,
-        status,
-        jobId
+         status,
+         status,
+         jobId,
+         leaseOwner,
+         leaseOwner,
+         leaseOwner
       ]
     );
   }
@@ -473,8 +496,17 @@ export class JobRepository {
     );
   }
 
-  async incrementRetry(jobId: number) {
-    await this.pool.query(`UPDATE publish_jobs SET retry_count = retry_count + 1 WHERE id = ?`, [jobId]);
+  async incrementRetry(jobId: number, leaseOwner?: string | null) {
+    await this.pool.query(
+      `UPDATE publish_jobs
+       SET retry_count = retry_count + 1
+       WHERE id = ?
+         AND (
+           (? IS NOT NULL AND lease_owner = ? AND lease_until >= NOW())
+           OR (? IS NULL AND (lease_owner IS NULL OR lease_until < NOW()))
+         )`,
+      [jobId, leaseOwner ?? null, leaseOwner ?? null, leaseOwner ?? null]
+    );
   }
 
   async listBlockedJobs(accountId: number): Promise<JobListItem[]> {
@@ -620,7 +652,7 @@ export class JobRepository {
     return result.affectedRows;
   }
 
-  async retryJob(jobId: number) {
+  async retryJob(jobId: number, leaseOwner?: string | null) {
     await this.pool.query(
       `UPDATE publish_jobs
        SET status = 'retry_waiting',
@@ -633,8 +665,12 @@ export class JobRepository {
            last_trace_id = NULL,
            started_at = NULL,
            finished_at = NULL
-       WHERE id = ?`,
-      [jobId]
+       WHERE id = ?
+         AND (
+           (? IS NOT NULL AND lease_owner = ? AND lease_until >= NOW())
+           OR (? IS NULL AND (lease_owner IS NULL OR lease_until < NOW()))
+         )`,
+      [jobId, leaseOwner ?? null, leaseOwner ?? null, leaseOwner ?? null]
     );
   }
 
