@@ -950,6 +950,8 @@ export type ToolTraceAction =
   | "type"
   | "press"
   | "wait"
+  | "scroll"
+  | "reload"
   | "get_url"
   | "screenshot";
 

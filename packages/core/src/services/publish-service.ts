@@ -413,101 +413,165 @@ export class PublishService {
       );
     }
 
-    const rawSubmitSnapshot = await this.ensureSubmitSurface({
+    return this.submitWithRecovery({
       traceBase,
       snapshot: afterPasteSnapshot,
+      content: richTextPayload.plainText,
       promptSnapshot: input.promptSnapshot
     });
-    const submitPlanState = await this.resolvePlanForStage({
-      traceBase,
-      stage: "publishing",
-      snapshot: rawSubmitSnapshot,
-      promptSnapshot: input.promptSnapshot,
-      expectedActions: ["CLICK_SUBMIT"]
-    });
-    const submitPlan = submitPlanState.plan;
+  }
 
-    if (submitPlan.nextAction !== "CLICK_SUBMIT") {
-      const clickedDirectly = hasEditorSemantic(submitPlanState.snapshot)
-        ? await this.tryDirectSubmitClick(traceBase)
-        : false;
-      if (clickedDirectly) {
-        await this.browserSkillService.wait(
-          {
-            ...traceBase,
-            stage: "publish_verify"
-          },
-          {
-            ms: 3500
-          }
-        );
+  /**
+   * Bounded recovery loop for layout changes and transient editor states.
+   * It may observe, scroll, re-plan and reload, but never bypasses login,
+   * challenge or risk gates and never clicks submit twice without verification.
+   */
+  private async submitWithRecovery(input: {
+    traceBase: {
+      sessionKey: string;
+      profileDir: string;
+      publishJobId: number;
+      publishAttemptId: number | null;
+      traceGroupId: string;
+      agentName: "publish_agent";
+    };
+    snapshot: PageSnapshot;
+    content: string;
+    promptSnapshot?: PromptSnapshotMap | null;
+  }) {
+    let snapshot = input.snapshot;
+    let lastPlan: PublishStepPlan | null = null;
+    const recoveryTrace: string[] = [];
 
-        return this.collectVerifiedPublishResult(traceBase, input.publishJobId, richTextPayload.plainText, input.promptSnapshot);
+    for (let step = 0; step < 6; step += 1) {
+      const surface = await this.ensureSubmitSurface({
+        traceBase: input.traceBase,
+        snapshot,
+        promptSnapshot: input.promptSnapshot
+      });
+      const planState = await this.resolvePlanForStage({
+        traceBase: input.traceBase,
+        stage: "publishing",
+        snapshot: surface,
+        promptSnapshot: input.promptSnapshot,
+        expectedActions: ["CLICK_SUBMIT"]
+      });
+      snapshot = planState.snapshot;
+      lastPlan = planState.plan;
+
+      if (lastPlan.nextAction === "REQUEST_MANUAL_LOGIN") {
+        throw new PublishFlowError("challenge_required", lastPlan.reason, snapshot.url, {
+          snapshot,
+          publishPlan: lastPlan,
+          recoveryTrace
+        });
       }
 
-      throw new PublishFlowError("submit_not_ready", submitPlan.reason || "当前页面还没有出现可提交的发布按钮。", submitPlanState.snapshot.url, {
-        snapshot: submitPlanState.snapshot,
-        publishPlan: submitPlan,
-        resumeAnchor: {
-          stage: "publishing",
-          currentUrl: submitPlanState.snapshot.url
+      if (lastPlan.nextAction === "VERIFY_RESULT") {
+        return this.collectVerifiedPublishResult(input.traceBase, input.traceBase.publishJobId, input.content, input.promptSnapshot);
+      }
+
+      const clicked = await this.trySubmitClick(input.traceBase, lastPlan);
+      if (clicked) {
+        recoveryTrace.push(`step_${step}:click_submit`);
+        await this.browserSkillService.wait({ ...input.traceBase, stage: "publish_verify" }, { ms: 3500 });
+        try {
+          return await this.collectVerifiedPublishResult(input.traceBase, input.traceBase.publishJobId, input.content, input.promptSnapshot);
+        } catch (error) {
+          if (!(error instanceof PublishFlowError) || error.failureType !== "publish_uncertain") {
+            throw error;
+          }
+          recoveryTrace.push(`step_${step}:verify_uncertain`);
+          snapshot = await this.browserSkillService.snapshot({ ...input.traceBase, stage: "publish_verify" });
+          if (isTerminalPublishState(snapshot)) {
+            throw error;
+          }
         }
-      });
+      } else {
+        recoveryTrace.push(`step_${step}:submit_target_missing`);
+        const failure = await this.layaService.classifyPublishFailure({
+          currentUrl: snapshot.url,
+          title: snapshot.title,
+          buttons: snapshot.buttons,
+          visibleTexts: snapshot.visibleTexts,
+          editorStillVisible: hasEditorSemantic(snapshot),
+          lastAction: "CLICK_SUBMIT",
+          lastError: lastPlan.reason
+        });
+        if (failure) {
+          recoveryTrace.push(`laya:${failure.failureType}:${failure.confidence}`);
+          if (failure.failureType === "LOGIN_REQUIRED" || failure.failureType === "CAPTCHA_REQUIRED" || failure.failureType === "RISK_CONTROL") {
+            throw new PublishFlowError("challenge_required", failure.reason, snapshot.url, {
+              snapshot,
+              recoveryTrace,
+              layaFailure: failure,
+              resumeAnchor: { stage: "publishing", currentUrl: snapshot.url }
+            });
+          }
+          if (failure.failureType === "NETWORK_TIMEOUT") {
+            await this.browserSkillService.wait({ ...input.traceBase, stage: "publishing" }, { ms: 1800 });
+          }
+        }
+      }
+
+      if (step === 1) {
+        await this.browserSkillService.scroll({ ...input.traceBase, stage: "publishing" }, { direction: "bottom" });
+        recoveryTrace.push("scroll_bottom");
+      } else if (step === 2) {
+        await this.browserSkillService.scroll({ ...input.traceBase, stage: "publishing" }, { direction: "top" });
+        recoveryTrace.push("scroll_top");
+      } else if (step === 3) {
+        await this.browserSkillService.reload({ ...input.traceBase, stage: "publishing" });
+        recoveryTrace.push("reload_page");
+        await this.browserSkillService.wait({ ...input.traceBase, stage: "publishing" }, { ms: 1800 });
+      } else {
+        await this.browserSkillService.wait({ ...input.traceBase, stage: "publishing" }, { ms: 1000 + step * 300 });
+      }
+
+      snapshot = await this.browserSkillService.snapshot({ ...input.traceBase, stage: "publishing" });
+      if (isManualGateState(snapshot)) {
+        throw new PublishFlowError("challenge_required", "页面出现登录、安全验证或验证码，需要人工处理。", snapshot.url, {
+          snapshot,
+          recoveryTrace,
+          resumeAnchor: { stage: "publishing", currentUrl: snapshot.url }
+        });
+      }
     }
 
-    const preferredSubmitTexts = sanitizeSubmitTargets(submitPlan.targetTexts);
-    const submitTargetTexts = preferredSubmitTexts.length ? preferredSubmitTexts : ["发布回答", "提交回答", "发布"];
+    throw new PublishFlowError("submit_not_ready", "发布 Agent 已完成有限恢复尝试，仍未找到可确认的发布入口。", snapshot.url, {
+      snapshot,
+      publishPlan: lastPlan,
+      recoveryTrace,
+      resumeAnchor: { stage: "publishing", currentUrl: snapshot.url }
+    });
+  }
+
+  private async trySubmitClick(
+    traceBase: {
+      sessionKey: string;
+      profileDir: string;
+      publishJobId: number;
+      publishAttemptId: number | null;
+      traceGroupId: string;
+      agentName: "publish_agent";
+    },
+    plan: PublishStepPlan
+  ) {
+    const names = sanitizeSubmitTargets(plan.targetTexts);
+    const targetNames = names.length ? names : SUBMIT_TEXT_CANDIDATES;
     try {
       await this.browserSkillService.click(
+        { ...traceBase, stage: "publishing" },
         {
-          ...traceBase,
-          stage: "publishing"
-        },
-        {
-          names: submitTargetTexts,
-          roles: ["button", "link"],
-          selectors: submitPlan.targetSelectors
+          names: targetNames,
+          roles: plan.targetRoles.length ? plan.targetRoles : ["button", "link"],
+          selectors: mergeSelectors(plan.targetSelectors, DIRECT_SUBMIT_SELECTORS)
         }
       );
+      return true;
     } catch {
-      const clickedDirectly = hasEditorSemantic(submitPlanState.snapshot)
-        ? await this.tryDirectSubmitClick(traceBase)
-        : false;
-      if (clickedDirectly) {
-        await this.browserSkillService.wait(
-          {
-            ...traceBase,
-            stage: "publish_verify"
-          },
-          {
-            ms: 3500
-          }
-        );
-
-        return this.collectVerifiedPublishResult(traceBase, input.publishJobId, richTextPayload.plainText, input.promptSnapshot);
-      }
-
-      throw new PublishFlowError("submit_not_ready", "没有找到“发布回答”按钮。", submitPlanState.snapshot.url, {
-        snapshot: submitPlanState.snapshot,
-        publishPlan: submitPlan,
-        resumeAnchor: {
-          stage: "publishing",
-          currentUrl: submitPlanState.snapshot.url
-        }
-      });
+      return this.tryDirectSubmitClick(traceBase);
     }
-
-    await this.browserSkillService.wait(
-      {
-        ...traceBase,
-        stage: "publish_verify"
-      },
-      {
-        ms: 3500
-      }
-    );
-
-    return this.collectVerifiedPublishResult(traceBase, input.publishJobId, richTextPayload.plainText, input.promptSnapshot);
   }
 
   private async pasteAnswerContent(context: BrowserSkillContext, payload: ZhihuRichTextPayload) {
@@ -1474,6 +1538,19 @@ export class PublishService {
 
 function mergeSelectors(primary: string[], fallback: string[]) {
   return Array.from(new Set([...primary, ...fallback].filter(Boolean)));
+}
+
+function isManualGateState(snapshot: PageSnapshot) {
+  const text = [snapshot.title, ...snapshot.visibleTexts, ...snapshot.buttons].join(" ").toLowerCase();
+  return (
+    snapshot.url.includes("/signin") ||
+    snapshot.url.includes("/login") ||
+    /验证码|安全验证|人机验证|登录后|请完成验证|unhuman|captcha|security check/.test(text)
+  );
+}
+
+function isTerminalPublishState(snapshot: PageSnapshot) {
+  return isManualGateState(snapshot) || /风控|违规|风险提示|内容审核/.test([snapshot.title, ...snapshot.visibleTexts].join(" "));
 }
 
 function buildFallbackPublishPlan(snapshot: PageSnapshot, expectedActions: PublishStepAction[]): PublishStepPlan | null {

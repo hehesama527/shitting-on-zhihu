@@ -37,6 +37,11 @@ type WaitInput = {
   ms: number;
 };
 
+type ScrollInput = {
+  direction?: "top" | "bottom";
+  amount?: number;
+};
+
 type ScreenshotInput = {
   label: string;
 };
@@ -89,6 +94,14 @@ export class BrowserSkillService {
 
   async wait(context: BrowserSkillContext, input: WaitInput) {
     return this.runSkill(context, "wait", input, () => this.runtime.wait(context, input));
+  }
+
+  async scroll(context: BrowserSkillContext, input: ScrollInput = {}) {
+    return this.runSkill(context, "scroll", input, () => this.runtime.scroll(context, input));
+  }
+
+  async reload(context: BrowserSkillContext) {
+    return this.runSkill(context, "reload", {}, () => this.runtime.reload(context));
   }
 
   async getUrl(context: BrowserSkillContext) {

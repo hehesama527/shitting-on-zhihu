@@ -33,6 +33,32 @@ export type LayaPublishResultReview = {
   reason: string;
 };
 
+export type LayaPublishFailureInput = {
+  currentUrl: string;
+  title?: string;
+  buttons?: string[];
+  visibleTexts?: string[];
+  editorStillVisible?: boolean;
+  lastAction?: string;
+  lastError?: string;
+};
+
+export type LayaPublishFailureClassification = {
+  failureType:
+    | "ELEMENT_NOT_FOUND"
+    | "EDITOR_NOT_READY"
+    | "SUBMIT_DISABLED"
+    | "LOGIN_REQUIRED"
+    | "CAPTCHA_REQUIRED"
+    | "RISK_CONTROL"
+    | "NETWORK_TIMEOUT"
+    | "PAGE_LAYOUT_CHANGED"
+    | "PUBLISH_UNCERTAIN"
+    | "UNKNOWN";
+  confidence: "high" | "medium" | "low";
+  reason: string;
+};
+
 export class LayaService {
   private readonly baseUrl: string;
   private readonly enabled: boolean;
@@ -186,6 +212,26 @@ export class LayaService {
         elapsedMs: Date.now() - start,
         error: String(err)
       });
+      return null;
+    }
+  }
+
+  async classifyPublishFailure(input: LayaPublishFailureInput): Promise<LayaPublishFailureClassification | null> {
+    if (!this.enabled) return null;
+    const start = Date.now();
+    try {
+      const res = await fetch(`${this.baseUrl}/api/classify-publish-failure`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(1200)
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as LayaPublishFailureClassification;
+      logDebugTiming("laya.classifyPublishFailure", "done", { elapsedMs: Date.now() - start, failureType: data.failureType });
+      return data;
+    } catch (err) {
+      logDebugTiming("laya.classifyPublishFailure", "fallback", { elapsedMs: Date.now() - start, error: String(err) });
       return null;
     }
   }

@@ -747,7 +747,9 @@ export class TopicRepository {
         };
       }
 
-      const answeredTopic = await this.findAnsweredTopicByQuestionUrl(questionUrl);
+      const candidateRows = await this.pool.query<TopicCandidateRow[]>(`SELECT account_id FROM topic_candidates WHERE id = ? LIMIT 1`, [candidateId]);
+      const candidateAccountId = candidateRows[0][0]?.account_id ?? null;
+      const answeredTopic = await this.findAnsweredTopicByQuestionUrl(questionUrl, candidateAccountId);
       if (answeredTopic) {
         await connection.query(
           `UPDATE topic_candidates
@@ -818,7 +820,7 @@ export class TopicRepository {
     }
   }
 
-  async findAnsweredTopicByQuestionUrl(questionUrl: string | null | undefined) {
+  async findAnsweredTopicByQuestionUrl(questionUrl: string | null | undefined, accountId?: number | null) {
     const normalizedQuestionUrl = normalizeZhihuQuestionUrl(questionUrl);
     const questionUrlHash = hashZhihuQuestionUrl(normalizedQuestionUrl);
     if (!normalizedQuestionUrl || !questionUrlHash) {
@@ -829,8 +831,9 @@ export class TopicRepository {
       `SELECT *
        FROM answered_topics
        WHERE question_url_hash = ?
+         AND (? IS NULL OR account_id IS NULL OR account_id = ?)
        LIMIT 1`,
-      [questionUrlHash]
+      [questionUrlHash, accountId ?? null, accountId ?? null]
     );
 
     const row = rows[0];
@@ -983,6 +986,7 @@ function buildAnsweredTopicExclusionClause(candidateAlias: string) {
     SELECT 1
     FROM answered_topics at
     WHERE at.question_url_hash = LOWER(SHA2(${candidateAlias}.question_url, 256))
+      AND (at.account_id IS NULL OR at.account_id = ${candidateAlias}.account_id)
   )`;
 }
 

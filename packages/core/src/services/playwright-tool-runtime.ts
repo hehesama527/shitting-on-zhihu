@@ -117,6 +117,11 @@ type WaitInput = {
   ms: number;
 };
 
+type ScrollInput = {
+  direction?: "top" | "bottom";
+  amount?: number;
+};
+
 type ScreenshotInput = {
   label: string;
 };
@@ -381,6 +386,29 @@ export class PlaywrightToolRuntime {
         waitedMs: input.ms,
         url: page.url()
       };
+    });
+  }
+
+  async scroll(traceContext: RuntimeTraceContext, input: ScrollInput = {}) {
+    return this.runWithTrace(traceContext, "scroll", input, async (page) => {
+      const direction = input.direction ?? "bottom";
+      const amount = Math.max(200, Math.min(input.amount ?? 720, 2400));
+      await page.evaluate(({ direction, amount }) => {
+        if (direction === "top") {
+          window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+          return;
+        }
+        window.scrollBy({ top: amount, behavior: "instant" as ScrollBehavior });
+      }, { direction, amount });
+      await page.waitForTimeout(250);
+      return { ok: true, direction, amount, url: page.url() };
+    });
+  }
+
+  async reload(traceContext: RuntimeTraceContext) {
+    return this.runWithTrace(traceContext, "reload", {}, async (page) => {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+      return { ok: true, url: page.url() };
     });
   }
 

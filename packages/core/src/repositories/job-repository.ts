@@ -221,6 +221,14 @@ export class JobRepository {
     return result.insertId;
   }
 
+  async deleteUnassignedQueuedJob(jobId: number) {
+    await this.pool.query(
+      `DELETE FROM publish_jobs
+       WHERE id = ? AND status = 'queued' AND topic_card_id IS NULL AND review_id IS NULL`,
+      [jobId]
+    );
+  }
+
   async replaceJobPayload(
     jobId: number,
     input: {
@@ -242,16 +250,15 @@ export class JobRepository {
            current_stage = 'review_passed',
            resume_anchor_json = NULL,
            last_error_type = NULL
-       WHERE id = ?`,
+       WHERE id = ?
+         AND (status NOT IN ('published', 'failed_terminal') OR status = ?)`,
       [input.topicCardId, input.reviewId, input.title, input.promptVersionSnapshotJson, jobId]
     );
   }
 
   async updateScheduledAt(jobId: number, scheduledAt: string | Date | null) {
     await this.pool.query(
-      `UPDATE publish_jobs
-       SET scheduled_at = ?
-       WHERE id = ?`,
+      `UPDATE publish_jobs SET scheduled_at = ? WHERE id = ?`,
       [normalizeMysqlDateTime(scheduledAt), jobId]
     );
   }
@@ -281,7 +288,8 @@ export class JobRepository {
            last_error_type = CASE WHEN ? THEN ? ELSE last_error_type END,
            started_at = CASE WHEN ? = 'publishing' AND started_at IS NULL THEN CURRENT_TIMESTAMP ELSE started_at END,
            finished_at = CASE WHEN ? IN ('published', 'failed_terminal') THEN CURRENT_TIMESTAMP ELSE finished_at END
-       WHERE id = ?`,
+       WHERE id = ?
+         AND status NOT IN ('published', 'failed_terminal')`,
       [
         status,
         hasFailureReason ? 1 : 0,
@@ -306,6 +314,49 @@ export class JobRepository {
         status,
         jobId
       ]
+    );
+  }
+
+  async claimJob(jobId: number, owner: string, leaseMinutes = 15, transitionStatus: JobStatus | null = "publishing") {
+    const leaseUntil = new Date(Date.now() + leaseMinutes * 60_000);
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `UPDATE publish_jobs
+       SET lease_owner = ?,
+           lease_until = ?,
+           status = CASE WHEN ? IS NULL THEN status ELSE ? END,
+           current_stage = CASE WHEN ? IS NULL THEN current_stage ELSE ? END
+       WHERE id = ?
+         AND status NOT IN ('published', 'failed_terminal', 'needs_manual_review')
+         AND (lease_until IS NULL OR lease_until < NOW() OR lease_owner = ?)` ,
+      [
+        owner,
+        leaseUntil,
+        transitionStatus,
+        transitionStatus,
+        transitionStatus,
+        transitionStatus ? "login_checking" : null,
+        jobId,
+        owner
+      ]
+    );
+    return result.affectedRows === 1;
+  }
+
+  async renewJobLease(jobId: number, owner: string, leaseMinutes = 15) {
+    const leaseUntil = new Date(Date.now() + leaseMinutes * 60_000);
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `UPDATE publish_jobs
+       SET lease_until = ?
+       WHERE id = ? AND lease_owner = ? AND lease_until >= NOW()`,
+      [leaseUntil, jobId, owner]
+    );
+    return result.affectedRows === 1;
+  }
+
+  async releaseJobLease(jobId: number, owner: string) {
+    await this.pool.query(
+      `UPDATE publish_jobs SET lease_owner = NULL, lease_until = NULL WHERE id = ? AND lease_owner = ?`,
+      [jobId, owner]
     );
   }
 

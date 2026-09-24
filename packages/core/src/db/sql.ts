@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS publish_jobs (
   last_trace_id VARCHAR(128) NULL,
   last_error_type VARCHAR(128) NULL,
   image_asset_id VARCHAR(36) NULL,
+  lease_owner VARCHAR(128) NULL,
+  lease_until DATETIME NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   CONSTRAINT fk_publish_jobs_account FOREIGN KEY (account_id) REFERENCES accounts(id),
@@ -116,7 +118,7 @@ CREATE TABLE IF NOT EXISTS answered_topics (
   answer_url VARCHAR(1024) NULL,
   answered_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uniq_answered_topics_question_hash (question_url_hash),
+  UNIQUE KEY uniq_answered_topics_account_question (account_id, question_url_hash),
   INDEX idx_answered_topics_account_answered (account_id, answered_at),
   INDEX idx_answered_topics_publish_job (publish_job_id),
   CONSTRAINT fk_answered_topics_account FOREIGN KEY (account_id) REFERENCES accounts(id),
@@ -689,6 +691,16 @@ const columnMigrations: ColumnMigration[] = [
     ddl: "ALTER TABLE publish_jobs ADD COLUMN image_asset_id VARCHAR(36) NULL AFTER last_error_type"
   },
   {
+    table: "publish_jobs",
+    column: "lease_owner",
+    ddl: "ALTER TABLE publish_jobs ADD COLUMN lease_owner VARCHAR(128) NULL AFTER image_asset_id"
+  },
+  {
+    table: "publish_jobs",
+    column: "lease_until",
+    ddl: "ALTER TABLE publish_jobs ADD COLUMN lease_until DATETIME NULL AFTER lease_owner"
+  },
+  {
     table: "daily_publish_schedule",
     column: "account_id",
     ddl: "ALTER TABLE daily_publish_schedule ADD COLUMN account_id INT NULL AFTER id"
@@ -721,6 +733,11 @@ const columnMigrations: ColumnMigration[] = [
 ];
 
 const rawMigrations = [
+  `DELETE a1 FROM answered_topics a1
+   INNER JOIN answered_topics a2
+     ON a1.question_url_hash = a2.question_url_hash
+    AND COALESCE(a1.account_id, 0) = COALESCE(a2.account_id, 0)
+    AND a1.id > a2.id`,
   "UPDATE accounts SET risk_domain = 'default' WHERE risk_domain IS NULL OR TRIM(risk_domain) = ''",
   "ALTER TABLE publish_jobs MODIFY COLUMN topic_card_id INT NULL",
   "ALTER TABLE publish_jobs MODIFY COLUMN review_id INT NULL",
@@ -744,10 +761,20 @@ const dropIndexMigrations: IndexMigration[] = [
     table: "daily_publish_schedule",
     index: "uniq_schedule_slot",
     ddl: "ALTER TABLE daily_publish_schedule DROP INDEX uniq_schedule_slot"
+  },
+  {
+    table: "answered_topics",
+    index: "uniq_answered_topics_question_hash",
+    ddl: "ALTER TABLE answered_topics DROP INDEX uniq_answered_topics_question_hash"
   }
 ];
 
 const addIndexMigrations: IndexMigration[] = [
+  {
+    table: "publish_jobs",
+    index: "idx_publish_jobs_lease",
+    ddl: "ALTER TABLE publish_jobs ADD INDEX idx_publish_jobs_lease (status, lease_until)"
+  },
   {
     table: "topic_candidates",
     index: "idx_topic_candidates_account_status",
@@ -767,6 +794,11 @@ const addIndexMigrations: IndexMigration[] = [
     table: "publish_jobs",
     index: "idx_publish_jobs_image_asset",
     ddl: "ALTER TABLE publish_jobs ADD INDEX idx_publish_jobs_image_asset (image_asset_id)"
+  },
+  {
+    table: "answered_topics",
+    index: "uniq_answered_topics_account_question",
+    ddl: "ALTER TABLE answered_topics ADD UNIQUE KEY uniq_answered_topics_account_question (account_id, question_url_hash)"
   }
 ];
 

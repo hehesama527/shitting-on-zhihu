@@ -155,7 +155,7 @@ export class TopicPipelineService {
         questionTitle: candidate.questionTitle
       });
 
-      const answeredTopic = await this.topicRepository.findAnsweredTopicByQuestionUrl(candidate.questionUrl);
+      const answeredTopic = await this.topicRepository.findAnsweredTopicByQuestionUrl(candidate.questionUrl, input?.accountContext?.accountId ?? null);
       if (answeredTopic) {
         await this.topicRepository.markCandidateDuplicate(candidate.id, answeredTopic.duplicateReason);
         logDebugTiming("topicPipeline.prepareNextPublishableDraft", "candidate_answered_duplicate", {

@@ -83,7 +83,11 @@ export class ScheduleRepository {
   }
 
   async assignJobToSlot(slotId: number, jobId: number) {
-    await this.pool.query(`UPDATE daily_publish_schedule SET publish_job_id = ? WHERE id = ?`, [jobId, slotId]);
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `UPDATE daily_publish_schedule SET publish_job_id = ? WHERE id = ? AND publish_job_id IS NULL`,
+      [jobId, slotId]
+    );
+    return result.affectedRows === 1;
   }
 
   async createAdhocSlot(accountId: number, scheduledAt: Date, status: ScheduleSlot["status"] = "pending") {

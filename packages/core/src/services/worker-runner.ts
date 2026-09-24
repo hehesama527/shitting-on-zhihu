@@ -1,5 +1,6 @@
 import type { FailureType, JobDetail, JobListItem, JobStage, PromptSnapshotMap, WorkerTickSummary } from "@zhihu-mvp/shared";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { AccountRepository } from "../repositories/account-repository.js";
 import { JobRepository } from "../repositories/job-repository.js";
 import { ScheduleRepository } from "../repositories/schedule-repository.js";
@@ -303,7 +304,11 @@ export class WorkerRunner {
         soulVersion: soulDocument.version,
         soulMarkdownSnapshot: soulDocument.markdown
       });
-      await this.scheduleRepository.assignJobToSlot(slot.id, jobId);
+      const assigned = await this.scheduleRepository.assignJobToSlot(slot.id, jobId);
+      if (!assigned) {
+        await this.jobRepository.deleteUnassignedQueuedJob(jobId);
+        continue;
+      }
       createdJobs += 1;
     }
 
@@ -521,6 +526,10 @@ export class WorkerRunner {
   }
 
   private async prepareJob(job: JobListItem, account: WorkerAccount): Promise<PrepareJobResult> {
+    const leaseOwner = `prepare-${process.pid}-${randomUUID()}`;
+    if (!(await this.jobRepository.claimJob(job.id, leaseOwner))) {
+      return { prepared: false, blockedByLogin: false, message: "任务已被其他 Worker 准备。" };
+    }
     try {
       const jobStartedAt = Date.now();
       logDebugTiming("worker.prepareQueuedJobs", "job_start", {
@@ -666,6 +675,8 @@ export class WorkerRunner {
         blockedByLogin: false,
         message: error instanceof Error ? error.message : "准备稿件时发生未知错误。"
       };
+    } finally {
+      await this.jobRepository.releaseJobLease(job.id, leaseOwner);
     }
   }
 
@@ -801,6 +812,12 @@ export class WorkerRunner {
     const sessionKey = `publish-account-${job.accountId}-job-${job.id}`;
     const baseTraceGroupId = `job-${job.id}-${Date.now()}`;
     let keepBrowserOpenForChallenge = false;
+    const leaseOwner = `worker-${process.pid}-${randomUUID()}`;
+    const claimed = await this.jobRepository.claimJob(job.id, leaseOwner);
+    if (!claimed) {
+      console.warn("[worker] skipped job because another worker owns its lease", { jobId: job.id, accountId: job.accountId });
+      return { blockedByLogin: false, message: "任务已被其他 Worker 领取。" };
+    }
 
     await this.jobRepository.updateJobStatus(job.id, "publishing", {
       currentStage: "login_checking",
@@ -1217,6 +1234,7 @@ export class WorkerRunner {
       if (!keepBrowserOpenForChallenge) {
         await this.publishService.closeSession(sessionKey);
       }
+      await this.jobRepository.releaseJobLease(job.id, leaseOwner);
     }
   }
 

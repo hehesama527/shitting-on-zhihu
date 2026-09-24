@@ -267,7 +267,7 @@ export class TopicDiscoveryService {
         continue;
       }
 
-      const answeredTopic = await this.topicRepository.findAnsweredTopicByQuestionUrl(questionUrl);
+      const answeredTopic = await this.topicRepository.findAnsweredTopicByQuestionUrl(questionUrl, accountId);
       if (answeredTopic) {
         if (candidate.status !== "published") {
           await this.topicRepository.markCandidateDuplicate(candidate.id, answeredTopic.duplicateReason);
