@@ -29,6 +29,7 @@ import {
   VideoService,
   VideoWorkerRunner,
   WorkerRunner,
+  LayaService,
   applySchemaMigrations,
   getAppConfig,
   getMysqlPool
@@ -97,15 +98,16 @@ const topicPipelineService = new TopicPipelineService(
 );
 const runtime = new PlaywrightToolRuntime(jobRepository);
 const browserSkillService = new BrowserSkillService(runtime, jobRepository);
-const sessionService = new SessionService(browserSkillService, llmService);
-const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService);
-const publishService = new PublishService(llmService, browserSkillService, sessionService);
+const layaService = new LayaService();
+const sessionService = new SessionService(browserSkillService, llmService, layaService);
+const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService, layaService);
+const publishService = new PublishService(llmService, browserSkillService, sessionService, layaService);
 const feishuNotificationService = new FeishuNotificationService();
 const videoRepository = new VideoRepository(pool);
 const videoAgentService = new VideoAgentService(llmService);
 const videoService = new VideoService(videoRepository, videoAgentService, feishuNotificationService);
 const videoWorkerRunner = new VideoWorkerRunner(videoRepository, videoService, videoAgentService);
-const failureResolutionService = new FailureResolutionService(llmService);
+const failureResolutionService = new FailureResolutionService(llmService, layaService);
 const opsIncidentService = new OpsIncidentService(
   opsIncidentRepository,
   opsDiagnosisService,
@@ -125,6 +127,12 @@ const runner = new WorkerRunner(
   feishuNotificationService,
   opsIncidentService
 );
+
+console.log("[worker] Laya status", JSON.stringify({
+  enabled: getAppConfig().layaEnabled,
+  endpoint: getAppConfig().layaApiUrl,
+  healthy: await layaService.isHealthy()
+}));
 
 let timer: NodeJS.Timeout | null = null;
 let stopped = false;

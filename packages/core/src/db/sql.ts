@@ -701,6 +701,11 @@ const columnMigrations: ColumnMigration[] = [
     ddl: "ALTER TABLE publish_jobs ADD COLUMN lease_until DATETIME NULL AFTER lease_owner"
   },
   {
+    table: "accounts",
+    column: "daily_publish_slots",
+    ddl: "ALTER TABLE accounts ADD COLUMN daily_publish_slots INT NOT NULL DEFAULT 1 AFTER profile_dir"
+  },
+  {
     table: "daily_publish_schedule",
     column: "account_id",
     ddl: "ALTER TABLE daily_publish_schedule ADD COLUMN account_id INT NULL AFTER id"

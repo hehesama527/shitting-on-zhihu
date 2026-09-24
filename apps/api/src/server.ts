@@ -12,6 +12,7 @@ import {
   HumanizerService,
   JobRepository,
   LlmService,
+  LayaService,
   OpsDiagnosisService,
   OpsIncidentRepository,
   OpsIncidentService,
@@ -78,6 +79,7 @@ await applySchemaMigrations(pool);
 const promptRepository = new PromptRepository(pool);
 const promptService = new PromptService(promptRepository);
 const llmService = new LlmService(promptRepository);
+const layaService = new LayaService();
 const accountSoulService = new AccountSoulService();
 const accountRepository = new AccountRepository(pool);
 const scheduleRepository = new ScheduleRepository(pool);
@@ -95,20 +97,21 @@ const topicPipelineService = new TopicPipelineService(
   topicBatchPlannerService,
   topicReviewService,
   reviewService,
-  humanizerService
+  humanizerService,
+  layaService
 );
 const runtime = new PlaywrightToolRuntime(jobRepository);
 const browserSkillService = new BrowserSkillService(runtime, jobRepository);
-const sessionService = new SessionService(browserSkillService, llmService);
-const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService);
-const publishService = new PublishService(llmService, browserSkillService, sessionService);
+const sessionService = new SessionService(browserSkillService, llmService, layaService);
+const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService, layaService);
+const publishService = new PublishService(llmService, browserSkillService, sessionService, layaService);
 const feishuNotificationService = new FeishuNotificationService();
 const videoRepository = new VideoRepository(pool);
 const videoAgentService = new VideoAgentService(llmService);
 const videoService = new VideoService(videoRepository, videoAgentService, feishuNotificationService);
 const videoCaseService = new VideoCaseService(videoRepository);
 const videoWorkerRunner = new VideoWorkerRunner(videoRepository, videoService, videoAgentService);
-const failureResolutionService = new FailureResolutionService(llmService);
+const failureResolutionService = new FailureResolutionService(llmService, layaService);
 const opsIncidentRepository = new OpsIncidentRepository(pool);
 const opsDiagnosisService = new OpsDiagnosisService();
 const opsIncidentService = new OpsIncidentService(
@@ -169,7 +172,11 @@ await scheduleService.bootstrapTodaySchedule();
 
 app.get("/health", async () => ({
   ok: true,
-  service: "api"
+  service: "api",
+  laya: {
+    enabled: await layaService.isHealthy(),
+    endpoint: getAppConfig().layaApiUrl
+  }
 }));
 
 app.post("/notifications/feishu/test", async () => feishuNotificationService.sendTestNotification());
