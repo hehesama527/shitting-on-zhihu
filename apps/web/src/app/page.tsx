@@ -33,6 +33,13 @@ export default function WorkspacePage() {
           <p>如果你已经确定要处理 Traditional 链路，也可以直接进入工作台总览，不经过 X 入口页分流。</p>
           <strong>直达 Traditional 工作台</strong>
         </Link>
+
+        <Link href="/videos" className="workspace-card workspace-card--hotspots">
+          <span className="mini-badge mini-badge--accent">Video Hub</span>
+          <h2>视频制作中台</h2>
+          <p>平台中立的横版视频生产链路，从选题、脚本、视觉规划到 TTS、配图、字幕和成片合成。</p>
+          <strong>进入视频制作中台</strong>
+        </Link>
       </section>
 
       <section className="workspace-hero" style={{ marginTop: "2.25rem" }}>

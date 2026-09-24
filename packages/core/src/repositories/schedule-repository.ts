@@ -173,7 +173,15 @@ export class ScheduleRepository {
       return 0;
     }
 
-    const slotCount = Math.random() < 0.5 ? 3 : 4;
+    const [accountRows] = await this.pool.query<RowDataPacket[]>(
+      `SELECT daily_publish_slots AS slots
+       FROM accounts
+       WHERE id = ?
+       LIMIT 1`,
+      [accountId]
+    );
+    const configuredSlots = Number(accountRows[0]?.slots ?? 0);
+    const slotCount = configuredSlots > 0 ? configuredSlots : 1;
     const slots = generateSlots(date, slotCount);
 
     for (const slot of slots) {
@@ -201,6 +209,63 @@ export class ScheduleRepository {
     );
 
     return rows.map(mapScheduleRow);
+  }
+
+  async reopenRetryableLockFailedSlots(now = new Date()): Promise<number> {
+    const scheduleDate = dayjs(now).tz(getAppConfig().timezone).format("YYYY-MM-DD");
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [rows] = await connection.query<Array<RowDataPacket & { job_id: number; slot_id: number }>>(
+        `SELECT pj.id AS job_id, s.id AS slot_id
+         FROM publish_jobs pj
+         JOIN daily_publish_schedule s ON s.publish_job_id = pj.id
+         WHERE s.schedule_date = ?
+           AND s.status = 'failed'
+           AND pj.status = 'failed_terminal'
+           AND (
+             pj.failure_reason LIKE '%Deadlock%'
+             OR pj.failure_reason LIKE '%try restarting transaction%'
+             OR pj.failure_reason LIKE '%Lock wait timeout%'
+           )
+         FOR UPDATE`,
+        [scheduleDate]
+      );
+
+      if (!rows.length) {
+        await connection.commit();
+        return 0;
+      }
+
+      const jobIds = rows.map((row) => row.job_id);
+      const slotIds = rows.map((row) => row.slot_id);
+      const jobPlaceholders = jobIds.map(() => "?").join(", ");
+      const slotPlaceholders = slotIds.map(() => "?").join(", ");
+
+      await connection.query(
+        `UPDATE publish_jobs
+         SET status = 'queued',
+             current_stage = 'queued',
+             failure_reason = '数据库锁冲突已自动重开，将先补题再继续准备。',
+             last_error_type = NULL,
+             finished_at = NULL
+         WHERE id IN (${jobPlaceholders})`,
+        jobIds
+      );
+      await connection.query(
+        `UPDATE daily_publish_schedule
+         SET status = 'pending'
+         WHERE id IN (${slotPlaceholders})`,
+        slotIds
+      );
+      await connection.commit();
+      return rows.length;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 }
 

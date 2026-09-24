@@ -13,6 +13,7 @@
     "@fastify/multipart": "^9.4.0",
     "@zhihu-mvp/shared": "0.1.2",
     "dayjs": "^1.11.13",
+    "mongodb": "^6.21.0",
     "mysql2": "^3.14.0",
     "openai": "^4.86.1",
     "playwright": "^1.51.0",

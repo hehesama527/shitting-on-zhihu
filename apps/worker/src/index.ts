@@ -24,6 +24,10 @@ import {
   TopicPipelineService,
   TopicRepository,
   TopicReviewService,
+  VideoAgentService,
+  VideoRepository,
+  VideoService,
+  VideoWorkerRunner,
   WorkerRunner,
   applySchemaMigrations,
   getAppConfig,
@@ -97,6 +101,10 @@ const sessionService = new SessionService(browserSkillService, llmService);
 const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService);
 const publishService = new PublishService(llmService, browserSkillService, sessionService);
 const feishuNotificationService = new FeishuNotificationService();
+const videoRepository = new VideoRepository(pool);
+const videoAgentService = new VideoAgentService(llmService);
+const videoService = new VideoService(videoRepository, videoAgentService, feishuNotificationService);
+const videoWorkerRunner = new VideoWorkerRunner(videoRepository, videoService, videoAgentService);
 const failureResolutionService = new FailureResolutionService(llmService);
 const opsIncidentService = new OpsIncidentService(
   opsIncidentRepository,
@@ -133,7 +141,8 @@ async function boot() {
     try {
       tryRotateLogs();
       const summary = await runner.tick();
-      console.log("[worker] tick", JSON.stringify(summary));
+      const videoSummary = await videoWorkerRunner.tick();
+      console.log("[worker] tick", JSON.stringify({ ...summary, videoSummary }));
     } catch (error) {
       console.error("[worker] tick failed", error);
       try {
@@ -167,14 +176,15 @@ async function shutdown() {
   if (timer) {
     clearTimeout(timer);
   }
+  await runner.closeAllSessions();
   await pool.end();
 }
 
 process.on("SIGINT", () => {
-  void shutdown();
+  void shutdown().then(() => process.exit(0));
 });
 process.on("SIGTERM", () => {
-  void shutdown();
+  void shutdown().then(() => process.exit(0));
 });
 
 await boot();

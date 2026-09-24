@@ -35,6 +35,28 @@ export interface AppConfig {
   imageAnalysisTimeoutMs: number;
   imageAnalysisRetryCount: number;
   antiDetectionV3Enabled: boolean;
+  videoDir: string;
+  videoImageModel: string;
+  videoImageSize: string;
+  videoRenderMock: boolean;
+  videoWeeklyTopicDay: number;
+  videoWeeklyTopicHour: number;
+  videoWeeklyTopicCount: number;
+  videoHotspotTopicThreshold: number;
+  videoProductDocPaths: string[];
+  videoProductDocMaxChars: number;
+  videoCaseDataSource: string;
+  videoCaseMongoUri: string;
+  videoCaseMongoDb: string;
+  videoCaseMongoKlineCollection: string | null;
+  videoCaseAllowExternalBinanceFallback: boolean;
+  cosyTtsBaseUrl: string | null;
+  cosyTtsCommand: string | null;
+  cosyGpuCheckCommand: string;
+  hyperframeBaseUrl: string | null;
+  remotionRenderCommand: string | null;
+  layaApiUrl: string | null;
+  layaEnabled: boolean;
 }
 
 let envLoaded = false;
@@ -70,8 +92,10 @@ export function getAppConfig(): AppConfig {
     browserChannel: normalizeBrowserChannel(process.env.BROWSER_CHANNEL),
     workerIntervalMs: Number(process.env.WORKER_INTERVAL_MS ?? 45_000),
     opsAgentIntervalMs: Number(process.env.OPS_AGENT_INTERVAL_MS ?? 60_000),
+    // 2026-09 产品定位从 CryptoPathX 切换为 dudu 中转站。旧的 CryptoPathX 关键词默认值：
+    // "币圈新手,加密货币市场,币圈交易,交易策略,止盈止损,趋势和震荡判断,量化回测,策略验证,可视化回测"
     topicKeywords: (process.env.TOPIC_KEYWORDS ??
-      "币圈新手,加密货币市场,币圈交易,交易策略,止盈止损,趋势和震荡判断,量化回测,策略验证,可视化回测")
+      "Claude Code,Codex,GPT API,大模型中转,AI编程工具,API访问不稳定,开发者工具,OpenRouter平替,API调用成本,AI辅助编程")
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean),
@@ -88,7 +112,31 @@ export function getAppConfig(): AppConfig {
     imageAnalysisConcurrency: Number(process.env.IMAGE_ANALYSIS_CONCURRENCY ?? 1),
     imageAnalysisTimeoutMs: Number(process.env.IMAGE_ANALYSIS_TIMEOUT_MS ?? 180_000),
     imageAnalysisRetryCount: Number(process.env.IMAGE_ANALYSIS_RETRY_COUNT ?? 2),
-    antiDetectionV3Enabled: process.env.ANTI_DETECTION_V3_ENABLED !== "false"
+    antiDetectionV3Enabled: process.env.ANTI_DETECTION_V3_ENABLED !== "false",
+    videoDir: process.env.VIDEO_DATA_DIR ?? path.join(process.env.DATA_DIR ?? path.join(workspaceRoot, "data"), "videos"),
+    videoImageModel: process.env.VIDEO_IMAGE_MODEL ?? "gpt-image-2.0",
+    videoImageSize: process.env.VIDEO_IMAGE_SIZE ?? "1920x1080",
+    videoRenderMock: process.env.VIDEO_RENDER_MOCK === "1" || process.env.VIDEO_RENDER_MOCK === "true",
+    videoWeeklyTopicDay: Number(process.env.VIDEO_WEEKLY_TOPIC_DAY ?? 1),
+    videoWeeklyTopicHour: Number(process.env.VIDEO_WEEKLY_TOPIC_HOUR ?? 9),
+    videoWeeklyTopicCount: Number(process.env.VIDEO_WEEKLY_TOPIC_COUNT ?? 10),
+    videoHotspotTopicThreshold: Number(process.env.VIDEO_HOTSPOT_TOPIC_THRESHOLD ?? 80),
+    videoProductDocPaths: parseEnvList(process.env.VIDEO_PRODUCT_DOC_PATHS),
+    videoProductDocMaxChars: Number(process.env.VIDEO_PRODUCT_DOC_MAX_CHARS ?? 24_000),
+    videoCaseDataSource: process.env.VIDEO_CASE_DATA_SOURCE ?? "cryptopathx_mongo",
+    videoCaseMongoUri: process.env.VIDEO_CASE_MONGO_URI ?? "mongodb://127.0.0.1:27017",
+    videoCaseMongoDb: process.env.VIDEO_CASE_MONGO_DB ?? "crypto_data_new",
+    videoCaseMongoKlineCollection: normalizeOptionalEnvValue(process.env.VIDEO_CASE_MONGO_KLINE_COLLECTION),
+    videoCaseAllowExternalBinanceFallback:
+      process.env.VIDEO_CASE_ALLOW_EXTERNAL_BINANCE_FALLBACK === "1" ||
+      process.env.VIDEO_CASE_ALLOW_EXTERNAL_BINANCE_FALLBACK === "true",
+    cosyTtsBaseUrl: normalizeOptionalEnvValue(process.env.COSY_TTS_BASE_URL),
+    cosyTtsCommand: normalizeOptionalEnvValue(process.env.COSY_TTS_COMMAND),
+    cosyGpuCheckCommand: process.env.COSY_GPU_CHECK_COMMAND ?? "nvidia-smi",
+    hyperframeBaseUrl: normalizeOptionalEnvValue(process.env.HYPERFRAME_BASE_URL),
+    remotionRenderCommand: normalizeOptionalEnvValue(process.env.REMOTION_RENDER_COMMAND),
+    layaApiUrl: normalizeOptionalEnvValue(process.env.LAYA_API_URL) ?? "http://127.0.0.1:8100",
+    layaEnabled: process.env.LAYA_ENABLED !== "false"
   };
 }
 
@@ -225,4 +273,21 @@ function normalizeBaseUrl(value: string | undefined) {
   }
 
   return trimmed.replace(/\/+$/, "");
+}
+
+function parseEnvList(value: string | undefined) {
+  if (typeof value !== "string") {
+    return [];
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const delimiter = trimmed.includes(";") ? ";" : ",";
+  return trimmed
+    .split(delimiter)
+    .map((item) => unquoteEnvValue(item.trim()))
+    .filter(Boolean);
 }

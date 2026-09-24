@@ -322,6 +322,201 @@ CREATE TABLE IF NOT EXISTS image_asset_usage_records (
   CONSTRAINT fk_image_asset_usage_asset FOREIGN KEY (asset_id) REFERENCES image_assets(id)
 );
 
+CREATE TABLE IF NOT EXISTS video_topic_batches (
+  id VARCHAR(36) PRIMARY KEY,
+  source VARCHAR(32) NOT NULL,
+  status VARCHAR(64) NOT NULL DEFAULT 'pending_feedback',
+  target_platform VARCHAR(32) NOT NULL DEFAULT 'agnostic',
+  target_count INT NOT NULL DEFAULT 10,
+  generated_count INT NOT NULL DEFAULT 0,
+  selected_count INT NOT NULL DEFAULT 0,
+  summary LONGTEXT NULL,
+  input_json LONGTEXT NULL,
+  output_json LONGTEXT NULL,
+  error_message LONGTEXT NULL,
+  notified_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_video_topic_batches_status_created (status, created_at),
+  INDEX idx_video_topic_batches_source_created (source, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS video_topic_candidates (
+  id VARCHAR(36) PRIMARY KEY,
+  batch_id VARCHAR(36) NOT NULL,
+  source VARCHAR(32) NOT NULL,
+  target_platform VARCHAR(32) NOT NULL DEFAULT 'agnostic',
+  title VARCHAR(160) NOT NULL,
+  brief LONGTEXT NOT NULL,
+  angle LONGTEXT NOT NULL,
+  video_format VARCHAR(64) NOT NULL,
+  target_audience LONGTEXT NOT NULL,
+  why_this LONGTEXT NOT NULL,
+  estimated_duration_sec INT NULL,
+  score INT NOT NULL DEFAULT 0,
+  topic_fit_score INT NULL,
+  production_score INT NULL,
+  score_breakdown_json LONGTEXT NULL,
+  risk_notes_json LONGTEXT NULL,
+  source_refs_json LONGTEXT NULL,
+  status VARCHAR(64) NOT NULL DEFAULT 'pending_feedback',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_video_candidates_batch (batch_id),
+  INDEX idx_video_candidates_status_created (status, created_at),
+  CONSTRAINT fk_video_candidates_batch FOREIGN KEY (batch_id) REFERENCES video_topic_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_topic_feedback (
+  id VARCHAR(36) PRIMARY KEY,
+  candidate_id VARCHAR(36) NOT NULL,
+  batch_id VARCHAR(36) NOT NULL,
+  decision VARCHAR(32) NOT NULL,
+  reason LONGTEXT NULL,
+  suggestion LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_video_topic_feedback_candidate (candidate_id, created_at),
+  CONSTRAINT fk_video_feedback_candidate FOREIGN KEY (candidate_id) REFERENCES video_topic_candidates(id),
+  CONSTRAINT fk_video_feedback_batch FOREIGN KEY (batch_id) REFERENCES video_topic_batches(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_projects (
+  id VARCHAR(36) PRIMARY KEY,
+  topic_candidate_id VARCHAR(36) NOT NULL,
+  title VARCHAR(160) NOT NULL,
+  status VARCHAR(64) NOT NULL DEFAULT 'topic_selected',
+  target_platform VARCHAR(32) NOT NULL DEFAULT 'agnostic',
+  aspect_ratio VARCHAR(16) NOT NULL DEFAULT '16:9',
+  target_duration_sec INT NULL,
+  script_pack_json LONGTEXT NULL,
+  visual_render_plan_json LONGTEXT NULL,
+  script_confirmed_at DATETIME NULL,
+  visual_render_plan_confirmed_at DATETIME NULL,
+  final_video_asset_id VARCHAR(36) NULL,
+  error_message LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_video_projects_status_updated (status, updated_at),
+  INDEX idx_video_projects_topic (topic_candidate_id),
+  CONSTRAINT fk_video_projects_topic FOREIGN KEY (topic_candidate_id) REFERENCES video_topic_candidates(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_case_intents (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  status VARCHAR(64) NOT NULL DEFAULT 'requested',
+  data_source VARCHAR(64) NOT NULL DEFAULT 'cryptopathx_mongo',
+  symbol VARCHAR(32) NOT NULL,
+  kline_interval VARCHAR(16) NOT NULL,
+  collection_name VARCHAR(128) NULL,
+  start_time DATETIME NOT NULL,
+  end_time DATETIME NOT NULL,
+  strategy_name VARCHAR(64) NOT NULL,
+  strategy_params_json LONGTEXT NOT NULL,
+  assumptions_json LONGTEXT NOT NULL,
+  request_json LONGTEXT NOT NULL,
+  error_message LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_video_case_intents_project_created (project_id, created_at),
+  INDEX idx_video_case_intents_status_updated (status, updated_at),
+  CONSTRAINT fk_video_case_intents_project FOREIGN KEY (project_id) REFERENCES video_projects(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_verified_case_packs (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  case_intent_id VARCHAR(36) NOT NULL,
+  case_id VARCHAR(128) NOT NULL,
+  status VARCHAR(64) NOT NULL,
+  data_source_json LONGTEXT NOT NULL,
+  strategy_json LONGTEXT NOT NULL,
+  metrics_json LONGTEXT NOT NULL,
+  review_json LONGTEXT NOT NULL,
+  chart_data_json LONGTEXT NOT NULL,
+  pack_json LONGTEXT NOT NULL,
+  error_message LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_video_case_packs_project_created (project_id, created_at),
+  INDEX idx_video_case_packs_case_intent (case_intent_id),
+  INDEX idx_video_case_packs_status_created (status, created_at),
+  CONSTRAINT fk_video_case_packs_project FOREIGN KEY (project_id) REFERENCES video_projects(id),
+  CONSTRAINT fk_video_case_packs_intent FOREIGN KEY (case_intent_id) REFERENCES video_case_intents(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_project_segments (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  segment_key VARCHAR(64) NOT NULL,
+  segment_order INT NOT NULL,
+  title VARCHAR(160) NOT NULL,
+  voiceover LONGTEXT NOT NULL,
+  subtitle LONGTEXT NOT NULL,
+  image_prompt LONGTEXT NOT NULL,
+  visual_intent LONGTEXT NULL,
+  visual_builder VARCHAR(32) NULL,
+  duration_sec INT NOT NULL DEFAULT 10,
+  chart_spec_json LONGTEXT NULL,
+  status VARCHAR(64) NOT NULL DEFAULT 'planned',
+  error_message LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_video_segment_key (project_id, segment_key),
+  INDEX idx_video_segments_project_order (project_id, segment_order),
+  INDEX idx_video_segments_status (status, updated_at),
+  CONSTRAINT fk_video_segments_project FOREIGN KEY (project_id) REFERENCES video_projects(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_assets (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  segment_id VARCHAR(36) NULL,
+  asset_type VARCHAR(32) NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  builder VARCHAR(32) NULL,
+  file_path VARCHAR(1024) NULL,
+  public_url VARCHAR(1024) NULL,
+  mime_type VARCHAR(128) NULL,
+  width INT NULL,
+  height INT NULL,
+  duration_ms INT NULL,
+  attempt_no INT NOT NULL DEFAULT 1,
+  metadata_json LONGTEXT NULL,
+  error_message LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_video_assets_project_type_status (project_id, asset_type, status),
+  INDEX idx_video_assets_segment_type_status (segment_id, asset_type, status),
+  CONSTRAINT fk_video_assets_project FOREIGN KEY (project_id) REFERENCES video_projects(id),
+  CONSTRAINT fk_video_assets_segment FOREIGN KEY (segment_id) REFERENCES video_project_segments(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_feedback_documents (
+  id VARCHAR(36) PRIMARY KEY,
+  scope VARCHAR(32) NOT NULL DEFAULT 'global',
+  project_id VARCHAR(36) NULL,
+  markdown LONGTEXT NOT NULL,
+  summary_json LONGTEXT NULL,
+  file_path VARCHAR(1024) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_video_feedback_documents_scope_created (scope, created_at),
+  CONSTRAINT fk_video_feedback_documents_project FOREIGN KEY (project_id) REFERENCES video_projects(id)
+);
+
+CREATE TABLE IF NOT EXISTS video_project_events (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  event_type VARCHAR(64) NOT NULL,
+  from_status VARCHAR(64) NULL,
+  to_status VARCHAR(64) NULL,
+  message LONGTEXT NULL,
+  payload_json LONGTEXT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_video_events_project_created (project_id, created_at),
+  CONSTRAINT fk_video_events_project FOREIGN KEY (project_id) REFERENCES video_projects(id)
+);
+
 CREATE TABLE IF NOT EXISTS ops_incidents (
   id INT AUTO_INCREMENT PRIMARY KEY,
   fingerprint CHAR(64) NOT NULL,

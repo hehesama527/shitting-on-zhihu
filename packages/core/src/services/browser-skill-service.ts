@@ -103,6 +103,14 @@ export class BrowserSkillService {
     await this.runtime.closeSession(sessionKey);
   }
 
+  scheduleSessionClose(sessionKey: string, delayMs: number) {
+    this.runtime.scheduleSessionClose(sessionKey, delayMs);
+  }
+
+  async closeAllSessions() {
+    await this.runtime.closeAllSessions();
+  }
+
   hasSession(sessionKey: string) {
     return this.runtime.hasSession(sessionKey);
   }

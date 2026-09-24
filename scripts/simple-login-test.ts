@@ -1,5 +1,5 @@
 // 简单的 Twitter 登录测试
-import { chromium } from 'playwright';
+import { launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 
 async function testBrowser() {
@@ -12,11 +12,10 @@ async function testBrowser() {
   console.log('🚀 正在启动浏览器...');
   console.log(`📁 配置文件目录：${profileDir}\n`);
 
-  const browser = await chromium.launchPersistentContext(profileDir, {
+  const browser = await launchPersistentContext({
+    userDataDir: profileDir,
     headless: false,
-    channel: 'msedge',
     viewport: { width: 1536, height: 864 },
-    args: ['--disable-blink-features=AutomationControlled'],
   });
 
   const page = browser.pages()[0];

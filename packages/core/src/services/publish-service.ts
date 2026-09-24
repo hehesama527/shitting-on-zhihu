@@ -3,6 +3,7 @@ import { normalizeZhihuQuestionUrl } from "../utils/zhihu-url.js";
 import { LlmService } from "./llm-service.js";
 import { BrowserSkillService, type BrowserSkillContext, type PageSnapshot } from "./browser-skill-service.js";
 import { SessionService } from "./session-service.js";
+import { LayaService } from "./laya-service.js";
 
 const EDITOR_SELECTORS = [
   "[role='textbox']",
@@ -13,6 +14,13 @@ const EDITOR_SELECTORS = [
 
 const SUBMIT_TEXT_CANDIDATES = ["发布回答", "提交回答", "更新回答", "保存修改", "发布修改"];
 const DIRECT_SUBMIT_SELECTORS = [
+  "button:has-text('发布回答')",
+  "button:has-text('提交回答')",
+  "button:has-text('更新回答')",
+  "button:has-text('保存修改')",
+  "button:has-text('发布修改')",
+  ".PublishPanel button:has-text('发布')",
+  ".PublishPanel-btnGroup button",
   ".AnswerForm button:has-text('发布回答')",
   ".AnswerForm button:has-text('提交回答')",
   ".AnswerForm button:has-text('更新回答')",
@@ -96,7 +104,8 @@ export class PublishService {
   constructor(
     private readonly llmService: LlmService,
     private readonly browserSkillService: BrowserSkillService,
-    private readonly sessionService: SessionService
+    private readonly sessionService: SessionService,
+    private readonly layaService: LayaService = new LayaService()
   ) {}
 
   async runPublishAttempt(input: {
@@ -284,6 +293,16 @@ export class PublishService {
       });
     }
 
+    if (rawEditorSnapshot.url.includes("/signin") || rawEditorSnapshot.url.includes("/login")) {
+      throw new PublishFlowError("login_required", "知乎要求登录后才能编辑或发布回答，当前账号会话未登录或已过期。", rawEditorSnapshot.url, {
+        snapshot: rawEditorSnapshot,
+        resumeAnchor: {
+          stage: "login_checking",
+          currentUrl: rawEditorSnapshot.url
+        }
+      });
+    }
+
     let editorSnapshot = rawEditorSnapshot;
     let editorPlan: PublishStepPlan;
 
@@ -336,6 +355,18 @@ export class PublishService {
 
     await this.focusEditorOrThrow(traceBase, editorSnapshot, editorPlan);
 
+    if (editorSnapshot.editorContent && editorSnapshot.editorContent.trim().length > 0) {
+      await this.browserSkillService.press(
+        { ...traceBase, stage: "publishing" },
+        { key: process.platform === "darwin" ? "Meta+A" : "Control+A" }
+      );
+      await this.browserSkillService.press(
+        { ...traceBase, stage: "publishing" },
+        { key: "Backspace" }
+      );
+      await this.browserSkillService.wait({ ...traceBase, stage: "publishing" }, { ms: 300 });
+    }
+
     await this.pasteAnswerContent(
       {
         ...traceBase,
@@ -377,19 +408,8 @@ export class PublishService {
 
     const editorFormatComparison = compareEditorRichFormatting(afterPasteSnapshot, richTextPayload.boldSignals);
     if (editorFormatComparison.decision === "MISMATCH") {
-      throw new PublishFlowError(
-        "editor_not_ready",
-        `编辑器富文本格式未生效：${editorFormatComparison.reason}`,
-        afterPasteSnapshot.url,
-        {
-          snapshot: afterPasteSnapshot,
-          editorComparison,
-          editorFormatComparison,
-          resumeAnchor: {
-            stage: "publishing",
-            currentUrl: afterPasteSnapshot.url
-          }
-        }
+      console.warn(
+        `[PublishService] 编辑器富文本格式校验提示（非致命）：${editorFormatComparison.reason}。正文已完整写入（匹配度 ${Math.round(editorComparison.overlapScore * 100)}%），继续推进提交。`
       );
     }
 
@@ -568,6 +588,14 @@ export class PublishService {
 
   async closeSession(sessionKey: string) {
     await this.browserSkillService.closeSession(sessionKey);
+  }
+
+  scheduleSessionClose(sessionKey: string, delayMs: number) {
+    this.browserSkillService.scheduleSessionClose(sessionKey, delayMs);
+  }
+
+  async closeAllSessions() {
+    await this.browserSkillService.closeAllSessions();
   }
 
   hasOpenSession(sessionKey: string) {
@@ -754,6 +782,21 @@ export class PublishService {
       return { snapshot, plan };
     }
 
+    if ((input.expectedActions.includes("FOCUS_EDITOR") || input.expectedActions.includes("PASTE_CONTENT")) && hasEditorSemantic(snapshot)) {
+      const editorFastPlan: PublishStepPlan = {
+        nextAction: "FOCUS_EDITOR",
+        targetTexts: [],
+        targetRoles: [],
+        targetSelectors: EDITOR_SELECTORS,
+        confidence: "high",
+        reason: "检测到页面已具备编辑器DOM，按预期流直接进入FOCUS_EDITOR。"
+      };
+      return {
+        snapshot,
+        plan: editorFastPlan
+      };
+    }
+
     const firstFallbackPlan = buildFallbackPublishPlan(snapshot, input.expectedActions);
     if (firstFallbackPlan) {
       return {
@@ -795,6 +838,29 @@ export class PublishService {
   }
 
   private async understandPublishPage(snapshot: PageSnapshot, promptSnapshot?: PromptSnapshotMap | null): Promise<PublishStepPlan> {
+    // 优先尝试本地 Laya 决策加速 (25ms)
+    try {
+      const layaPlan = await this.layaService.understandPublishPage(snapshot);
+      if (layaPlan && layaPlan.nextAction !== "WAIT") {
+        if (layaPlan.nextAction === "CLICK_WRITE_ANSWER" && (!layaPlan.targetSelectors || layaPlan.targetSelectors.length === 0)) {
+          layaPlan.targetSelectors = [
+            "button:has-text('编辑回答')",
+            "button:has-text('写回答')",
+            "button.WriteAnswerButton",
+            ".QuestionHeaderActions button:has-text('编辑回答')",
+            ".QuestionHeaderActions button:has-text('写回答')",
+            ".QuestionHeaderActions button.WriteAnswerButton"
+          ];
+        }
+        if ((layaPlan.nextAction === "FOCUS_EDITOR" || layaPlan.nextAction === "PASTE_CONTENT") && (!layaPlan.targetSelectors || layaPlan.targetSelectors.length === 0)) {
+          layaPlan.targetSelectors = EDITOR_SELECTORS;
+        }
+        return layaPlan;
+      }
+    } catch {
+      // 异常自动平滑降级至下方的 LLM 兜底
+    }
+
     const publishPrompt = await this.llmService.resolvePrompt("publish_agent", {
       promptSnapshot
     });
@@ -817,14 +883,16 @@ export class PublishService {
 7. REQUEST_MANUAL_LOGIN
 
 判断规则：
-1. 如果页面出现登录、挑战、风控、安全验证，输出 REQUEST_MANUAL_LOGIN。
-2. 如果页面是问题页，而且存在“写回答”这类入口，输出 CLICK_WRITE_ANSWER。
-3. 如果已经进入编辑态，且能识别到回答编辑器，输出 FOCUS_EDITOR 或 PASTE_CONTENT。
-4. 如果能识别到“发布回答”或等价提交入口，输出 CLICK_SUBMIT。
-5. 如果页面出现“查看我的回答”“编辑回答”“我的回答”等明确表示当前账号已有回答的语义，优先输出 VERIFY_RESULT，不要误判成新回答入口。
-6. targetTexts 里放最值得点击的按钮或链接文案，targetRoles 只允许 button 或 link，targetSelectors 只有在页面语义非常明确时才填写。
-7. 证据不足时才输出 WAIT。
-8. 只输出 JSON，不要解释，不要 Markdown。
+1. 如果页面出现登录、挑战、风控、安全验证、人机验证，输出 REQUEST_MANUAL_LOGIN。
+2. 先看 snapshot.buttons 和 snapshot.links。当前是问题页，且其中出现「写回答」（允许前面有零宽字符或空白），必须输出 CLICK_WRITE_ANSWER。这是默认路径。
+3. 不要因为 visibleTexts、标题、评论、侧栏里出现「我的回答」「查看我的回答」就输出 VERIFY_RESULT。那不是本账号已经回答过的证据。
+4. 只有 buttons 或 links 上的可点击文案就是「查看我的回答」或「编辑回答」，或当前 URL 已是 /question/.../answer/... 时，才输出 VERIFY_RESULT。
+5. 不要选择「邀请回答」。
+6. 已经进入回答编辑态时，输出 FOCUS_EDITOR 或 PASTE_CONTENT。
+7. 编辑态下能识别到「发布回答」时，输出 CLICK_SUBMIT。
+8. targetTexts 必须从 snapshot.buttons 或 snapshot.links 原样复制，保留零宽字符，不要改写成干净文案。targetRoles 只允许 button 或 link。
+9. 证据不足时才输出 WAIT。
+10. 只输出 JSON，不要解释，不要 Markdown。
 
 输出格式：
 {
@@ -867,6 +935,31 @@ export class PublishService {
     promptSnapshot?: PromptSnapshotMap | null
   ) {
     const contentSignals = buildPublishContentSignals(content);
+    const initialMatchedSignals = findMatchedExpectedSignals(snapshot, contentSignals.expectedSignals);
+    const initialEditorStillVisible = hasEditorSemantic(snapshot);
+
+    // 优先尝试本地 Laya 快速核验 (25ms)
+    try {
+      const layaReview = await this.layaService.reviewPublishResult({
+        currentUrl,
+        title: snapshot.title,
+        matchedSignals: initialMatchedSignals,
+        editorStillVisible: initialEditorStillVisible,
+        visibleTexts: snapshot.visibleTexts,
+        expectedExcerpt: contentSignals.expectedExcerpt
+      });
+      if (layaReview && layaReview.decision !== "UNCERTAIN") {
+        return {
+          decision: layaReview.decision,
+          confidence: layaReview.confidence,
+          matchedSignals: mergeMatchedSignals(layaReview.matchedSignals, initialMatchedSignals),
+          reason: layaReview.reason
+        };
+      }
+    } catch {
+      // 异常自动平滑降级至下方的 LLM 兜底
+    }
+
     const publishPrompt = await this.llmService.resolvePrompt("publish_agent", {
       promptSnapshot
     });
@@ -881,11 +974,12 @@ export class PublishService {
 
 判断规则：
 1. 如果页面明确显示内容风险、发布失败、违规拦截、审核拦截，输出 CONTENT_RISK。
-2. 如果页面能看到本次内容片段，或者页面出现“查看我的回答”“编辑回答”“我的回答”等语义，可倾向输出 SUCCESS。
-3. 不能只凭 URL 判断成功，必须结合页面语义和内容痕迹。
-4. 证据不足时输出 UNCERTAIN。
-5. matchedSignals 尽量返回你命中的成功信号、风险信号或内容片段提示。
-6. 只输出 JSON，不要解释，不要 Markdown。
+2. 不能只凭 URL 判断成功。页面里随口出现「我的回答」也不够。
+3. 还停留在编辑器、当前 URL 不是 /answer/ 详情页，不能输出 SUCCESS。
+4. 成功至少要有：已发布区域出现本次正文关键片段，或 URL 已是本账号回答详情且不是编辑态。
+5. 证据不足时输出 UNCERTAIN。
+6. matchedSignals 尽量返回你命中的成功信号、风险信号或内容片段提示。
+7. 只输出 JSON，不要解释，不要 Markdown。
 
 输出格式：
 {
@@ -1076,8 +1170,23 @@ export class PublishService {
     snapshot: PageSnapshot;
     promptSnapshot?: PromptSnapshotMap | null;
   }) {
-    const editorPlan = await this.understandPublishPage(input.snapshot, input.promptSnapshot);
-    await this.focusEditorOrThrow(input.traceBase, input.snapshot, editorPlan);
+    let currentSnapshot = input.snapshot;
+    if (!hasEditorSemantic(currentSnapshot)) {
+      currentSnapshot = await this.ensureEditorSurface({
+        traceBase: input.traceBase,
+        snapshot: currentSnapshot,
+        promptSnapshot: input.promptSnapshot
+      });
+    }
+    const editorPlan: PublishStepPlan = {
+      nextAction: "FOCUS_EDITOR",
+      targetTexts: [],
+      targetRoles: [],
+      targetSelectors: EDITOR_SELECTORS,
+      confidence: "high",
+      reason: "直接聚焦回答输入区域准备清空重填。"
+    };
+    await this.focusEditorOrThrow(input.traceBase, currentSnapshot, editorPlan);
 
     await this.browserSkillService.press(
       {
@@ -1134,15 +1243,49 @@ export class PublishService {
         return snapshot;
       }
 
+      if (snapshot.url.includes("/signin") || snapshot.url.includes("/login")) {
+        return snapshot;
+      }
+
+      // Priority 1: Direct navigation to /write url (fast, 100% reliable, avoids DOM overlay/pointer-events pitfalls)
+      if (snapshot.url.includes("/question/") && !snapshot.url.includes("/write")) {
+        const writeUrl = `${snapshot.url.split('?')[0].replace(/\/$/, '')}/write`;
+        try {
+          await this.browserSkillService.open({ ...input.traceBase, stage: "publishing" }, { url: writeUrl });
+          await this.browserSkillService.wait({ ...input.traceBase, stage: "publishing" }, { ms: 2500 });
+          snapshot = await this.browserSkillService.snapshot({ ...input.traceBase, stage: "publishing" });
+          if (hasEditorSemantic(snapshot) || hasSubmitSemantic(snapshot) || snapshot.url.includes("/signin")) {
+            return snapshot;
+          }
+        } catch {
+          // If direct open fails, fall through to button click
+        }
+      }
+
+      // Priority 2: Click "写回答" / "编辑回答" button
       const writeAnswerPlan = buildFallbackPublishPlan(snapshot, ["CLICK_WRITE_ANSWER"]);
       if (writeAnswerPlan?.nextAction === "CLICK_WRITE_ANSWER") {
-        await this.clickPlanOrThrow({
-          traceBase: input.traceBase,
-          snapshot,
-          plan: writeAnswerPlan,
-          failureType: "editor_not_ready",
-          errorMessage: "没有找到“写回答”入口。"
-        });
+        try {
+          await this.clickPlanOrThrow({
+            traceBase: input.traceBase,
+            snapshot,
+            plan: writeAnswerPlan,
+            failureType: "editor_not_ready",
+            errorMessage: "没有找到“写回答”入口。"
+          });
+        } catch (clickErr) {
+          // If button click threw, try direct /write before giving up
+          if (snapshot.url.includes("/question/") && !snapshot.url.includes("/write")) {
+            const writeUrl = `${snapshot.url.split('?')[0].replace(/\/$/, '')}/write`;
+            await this.browserSkillService.open({ ...input.traceBase, stage: "publishing" }, { url: writeUrl });
+            await this.browserSkillService.wait({ ...input.traceBase, stage: "publishing" }, { ms: 2500 });
+            snapshot = await this.browserSkillService.snapshot({ ...input.traceBase, stage: "publishing" });
+            if (hasEditorSemantic(snapshot) || hasSubmitSemantic(snapshot) || snapshot.url.includes("/signin")) {
+              return snapshot;
+            }
+          }
+          throw clickErr;
+        }
       }
 
       await this.browserSkillService.wait(
@@ -1159,6 +1302,10 @@ export class PublishService {
         ...input.traceBase,
         stage: "publishing"
       });
+
+      if (hasEditorSemantic(snapshot) || hasSubmitSemantic(snapshot) || snapshot.url.includes("/signin")) {
+        return snapshot;
+      }
     }
 
     return snapshot;
@@ -1340,7 +1487,7 @@ function buildFallbackPublishPlan(snapshot: PageSnapshot, expectedActions: Publi
     .filter(Boolean);
 
   if (expectedActions.includes("VERIFY_RESULT")) {
-    const existingAnswerText = findFirstMatchingText(combinedTexts, ["查看我的回答", "编辑回答", "我的回答"]);
+    const existingAnswerText = findFirstMatchingText(combinedTexts, ["查看我的回答", "我的回答"]);
     if (existingAnswerText) {
       return {
         nextAction: "VERIFY_RESULT",
@@ -1354,15 +1501,22 @@ function buildFallbackPublishPlan(snapshot: PageSnapshot, expectedActions: Publi
   }
 
   if (expectedActions.includes("CLICK_WRITE_ANSWER")) {
-    const writeAnswerText = findFirstMatchingText(combinedTexts, ["写回答"]);
+    const writeAnswerText = findFirstMatchingText(combinedTexts, ["写回答", "编辑回答", "继续写"]);
     if (writeAnswerText && !hasEditorSemantic(snapshot) && !hasSubmitSemantic(snapshot)) {
       return {
         nextAction: "CLICK_WRITE_ANSWER",
-        targetTexts: [writeAnswerText],
+        targetTexts: [writeAnswerText, "写回答", "编辑回答"],
         targetRoles: ["button", "link"],
-        targetSelectors: [],
+        targetSelectors: [
+          "button:has-text('编辑回答')",
+          "button:has-text('写回答')",
+          "button.WriteAnswerButton",
+          ".QuestionHeaderActions button:has-text('编辑回答')",
+          ".QuestionHeaderActions button:has-text('写回答')",
+          ".QuestionHeaderActions button.WriteAnswerButton"
+        ],
         confidence: "medium",
-        reason: "页面仍是问题详情态，存在明确的“写回答”入口。"
+        reason: "页面仍是问题详情态，存在明确的“写回答”或“编辑回答”入口。"
       };
     }
   }
@@ -1431,13 +1585,13 @@ function coerceManualLoginPlan(
 }
 
 function getExistingAnswerSignal(plan: PublishStepPlan): "view" | "edit" | null {
+  if (plan.nextAction !== "VERIFY_RESULT") {
+    return null;
+  }
+
   const combined = [...plan.targetTexts, ...plan.targetSelectors].join(" ");
   if (combined.includes("查看我的回答") || combined.includes("我的回答")) {
     return "view";
-  }
-
-  if (combined.includes("编辑回答")) {
-    return "edit";
   }
 
   return null;

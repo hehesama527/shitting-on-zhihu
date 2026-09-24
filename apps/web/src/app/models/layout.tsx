@@ -13,6 +13,7 @@ export default function ModelsLayout({ children }: Readonly<{ children: ReactNod
         { href: "/models/images", label: "配图中心" },
         { href: "/models/zhihu", label: "知乎绑定" },
         { href: "/models/x", label: "X 绑定" },
+        { href: "/models/video", label: "Video Hub" },
         { href: "/models/system", label: "系统绑定" }
       ]}
       switchHref="/images"

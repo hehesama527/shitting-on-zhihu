@@ -1,6 +1,12 @@
 import type { DraftListItem, TopicListItem, TopicPriority, TopicValidityStatus } from "@zhihu-mvp/shared";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { hashZhihuQuestionUrl, normalizeZhihuQuestionUrl } from "../utils/zhihu-url.js";
+import { withDeadlockRetry } from "../utils/mysql-retry.js";
+import {
+  buildClaimedQuestionExclusionClause,
+  buildCrossAccountQuestionDuplicateReason,
+  buildQuestionLockName
+} from "./topic-question-uniqueness.js";
 
 type TopicCandidateRow = RowDataPacket & {
   id: number;
@@ -132,6 +138,39 @@ export class TopicRepository {
     };
   }
 
+  async listOpenCandidateHolders(accountIds?: number[]) {
+    const accountFilter = accountIds?.length
+      ? `AND tc.account_id IN (${accountIds.map(() => "?").join(", ")})`
+      : "";
+    const params = accountIds?.length ? accountIds : [];
+    const [rows] = await this.pool.query<Array<RowDataPacket & { id: number; account_id: number }>>(
+      `SELECT tc.id, tc.account_id
+       FROM topic_candidates tc
+       WHERE tc.status IN ('new', 'processing')
+         AND tc.validity_status IN ('unchecked', 'valid')
+         ${buildAnsweredTopicExclusionClause("tc")}
+         ${buildClaimedQuestionExclusionClause("tc")}
+         ${accountFilter}
+       ORDER BY tc.created_at ASC, tc.id ASC`,
+      params
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      accountId: Number(row.account_id)
+    }));
+  }
+
+  async reassignOpenCandidateAccount(candidateId: number, accountId: number) {
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `UPDATE topic_candidates
+       SET account_id = ?
+       WHERE id = ?
+         AND status = 'new'`,
+      [accountId, candidateId]
+    );
+    return result.affectedRows > 0;
+  }
+
   async listOpenCandidates(limit = 20, accountId?: number | null) {
     const accountFilter = accountId != null ? "AND tc.account_id = ?" : "";
     const params = accountId != null ? [accountId, limit] : [limit];
@@ -141,6 +180,7 @@ export class TopicRepository {
        WHERE tc.status IN ('new', 'processing')
          AND tc.validity_status IN ('unchecked', 'valid')
          ${buildAnsweredTopicExclusionClause("tc")}
+         ${buildClaimedQuestionExclusionClause("tc")}
          ${accountFilter}
        ORDER BY
          CASE tc.priority
@@ -272,6 +312,7 @@ export class TopicRepository {
        WHERE tc.status IN ('new', 'processing')
          AND tc.validity_status IN ('unchecked', 'valid')
          ${buildAnsweredTopicExclusionClause("tc")}
+         ${buildClaimedQuestionExclusionClause("tc")}
          ${accountFilter}`,
       params
     );
@@ -287,6 +328,7 @@ export class TopicRepository {
        WHERE tc.status IN ('new', 'processing')
          AND tc.validity_status IN ('unchecked', 'valid')
          ${buildAnsweredTopicExclusionClause("tc")}
+         ${buildClaimedQuestionExclusionClause("tc")}
          ${accountFilter}`,
       params
     );
@@ -297,8 +339,9 @@ export class TopicRepository {
     const accountFilter = accountId != null ? "AND tc.account_id = ?" : "";
     const params = accountId != null ? [accountId] : [];
 
-    await this.pool.query(
-      `UPDATE topic_candidates tc
+    await withDeadlockRetry(() =>
+      this.pool.query(
+        `UPDATE topic_candidates tc
        JOIN answered_topics at ON at.question_url_hash = LOWER(SHA2(tc.question_url, 256))
        SET tc.status = 'blocked_duplicate',
            tc.duplication_fingerprint_text = CASE
@@ -308,13 +351,47 @@ export class TopicRepository {
            END
        WHERE tc.status IN ('new', 'processing', 'accepted')
          ${accountFilter}`,
-      params
+        params
+      )
+    );
+    await this.markCrossAccountClaimedCandidates(accountId);
+  }
+
+  async markCrossAccountClaimedCandidates(accountId?: number | null) {
+    const accountFilter = accountId != null ? "AND tc.account_id = ?" : "";
+    const params = accountId != null ? [accountId] : [];
+
+    await withDeadlockRetry(() =>
+      this.pool.query(
+        `UPDATE topic_candidates tc
+       JOIN topic_candidates owner
+         ON owner.id <> tc.id
+        AND LOWER(SHA2(owner.question_url, 256)) = LOWER(SHA2(tc.question_url, 256))
+        AND (
+          owner.status IN ('processing', 'accepted', 'published')
+          OR (
+            owner.status = 'new'
+            AND owner.id < tc.id
+          )
+        )
+       SET tc.status = 'blocked_duplicate',
+           tc.duplication_fingerprint_text = CONCAT(
+             '该问题已被账号 ',
+             COALESCE(owner.account_id, 0),
+             ' 占用，全站只回答一次：',
+             owner.question_title
+           )
+       WHERE tc.status IN ('new', 'processing')
+         ${accountFilter}`,
+        params
+      )
     );
   }
 
   async reconcileAcceptedCandidateStatuses() {
-    await this.pool.query(
-      `UPDATE topic_candidates tc
+    await withDeadlockRetry(() =>
+      this.pool.query(
+        `UPDATE topic_candidates tc
        JOIN topic_cards tcard ON tcard.topic_candidate_id = tc.id
        JOIN publish_jobs pj ON pj.topic_card_id = tcard.id
        SET tc.status = CASE
@@ -324,6 +401,7 @@ export class TopicRepository {
        END
        WHERE tc.status = 'accepted'
          AND pj.status IN ('published', 'failed_terminal')`
+      )
     );
   }
 
@@ -591,6 +669,153 @@ export class TopicRepository {
       content: (row.approved_content as string | null) ?? "",
       draftJson: row.output_json as string
     }));
+  }
+
+  async findClaimedQuestionByUrl(questionUrl: string | null | undefined, excludeCandidateId?: number | null) {
+    const questionUrlHash = hashZhihuQuestionUrl(questionUrl);
+    if (!questionUrlHash) {
+      return null;
+    }
+
+    const excludeClause = excludeCandidateId != null ? "AND id <> ?" : "";
+    const params = excludeCandidateId != null ? [questionUrlHash, excludeCandidateId] : [questionUrlHash];
+    const [rows] = await this.pool.query<TopicCandidateRow[]>(
+      `SELECT *
+       FROM topic_candidates
+       WHERE LOWER(SHA2(question_url, 256)) = ?
+         ${excludeClause}
+         AND (
+           status IN ('processing', 'accepted', 'published')
+           OR status = 'new'
+         )
+       ORDER BY
+         CASE status
+           WHEN 'published' THEN 1
+           WHEN 'accepted' THEN 2
+           WHEN 'processing' THEN 3
+           ELSE 4
+         END ASC,
+         id ASC
+       LIMIT 1`,
+      params
+    );
+
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+    if (
+      row.status === "new" &&
+      excludeCandidateId != null &&
+      row.id >= excludeCandidateId
+    ) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      accountId: row.account_id,
+      questionUrl: row.question_url,
+      questionTitle: row.question_title,
+      status: row.status,
+      duplicateReason: buildCrossAccountQuestionDuplicateReason(row.question_title, row.account_id)
+    };
+  }
+
+  async claimQuestionUrlForWriting(candidateId: number, questionUrl: string) {
+    const questionUrlHash = hashZhihuQuestionUrl(questionUrl);
+    if (!questionUrlHash) {
+      return {
+        claimed: false,
+        reason: "question url is invalid"
+      };
+    }
+
+    const connection = await this.pool.getConnection();
+    const lockName = buildQuestionLockName(questionUrlHash);
+    let lockHeld = false;
+    try {
+      const [lockRows] = await connection.query<RowDataPacket[]>(
+        `SELECT GET_LOCK(?, 10) AS lock_ok`,
+        [lockName]
+      );
+      lockHeld = Number(lockRows[0]?.lock_ok) === 1;
+      if (!lockHeld) {
+        return {
+          claimed: false,
+          reason: "question claim lock timeout"
+        };
+      }
+
+      const answeredTopic = await this.findAnsweredTopicByQuestionUrl(questionUrl);
+      if (answeredTopic) {
+        await connection.query(
+          `UPDATE topic_candidates
+           SET status = 'blocked_duplicate',
+               duplication_fingerprint_text = ?
+           WHERE id = ?`,
+          [answeredTopic.duplicateReason, candidateId]
+        );
+        return {
+          claimed: false,
+          reason: answeredTopic.duplicateReason
+        };
+      }
+
+      const claimedOwner = await this.findClaimedQuestionByUrl(questionUrl, candidateId);
+      if (claimedOwner && claimedOwner.status !== "new") {
+        await connection.query(
+          `UPDATE topic_candidates
+           SET status = 'blocked_duplicate',
+               duplication_fingerprint_text = ?
+           WHERE id = ?`,
+          [claimedOwner.duplicateReason, candidateId]
+        );
+        return {
+          claimed: false,
+          reason: claimedOwner.duplicateReason
+        };
+      }
+
+      const [currentRows] = await connection.query<TopicCandidateRow[]>(
+        `SELECT * FROM topic_candidates WHERE id = ? LIMIT 1`,
+        [candidateId]
+      );
+      const current = currentRows[0];
+      if (!current) {
+        return {
+          claimed: false,
+          reason: "topic candidate not found"
+        };
+      }
+
+      await connection.query(
+        `UPDATE topic_candidates
+         SET status = 'processing'
+         WHERE id = ?`,
+        [candidateId]
+      );
+      await connection.query(
+        `UPDATE topic_candidates
+         SET status = 'blocked_duplicate',
+             duplication_fingerprint_text = ?
+         WHERE LOWER(SHA2(question_url, 256)) = ?
+           AND id <> ?
+           AND status IN ('new', 'processing')`,
+        [
+          buildCrossAccountQuestionDuplicateReason(current.question_title, current.account_id),
+          questionUrlHash,
+          candidateId
+        ]
+      );
+
+      return { claimed: true as const };
+    } finally {
+      if (lockHeld) {
+        await connection.query(`SELECT RELEASE_LOCK(?)`, [lockName]);
+      }
+      connection.release();
+    }
   }
 
   async findAnsweredTopicByQuestionUrl(questionUrl: string | null | undefined) {

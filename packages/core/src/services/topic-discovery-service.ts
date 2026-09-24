@@ -104,11 +104,23 @@ export class TopicDiscoveryService {
     promptSnapshot?: PromptSnapshotMap | null;
     accountContext?: AccountPromptContext | null;
     accountSoulMarkdown?: string | null;
+    fillSharedBatch?: boolean;
   }) {
+    const existingActiveCandidates = await this.topicRepository.countActiveCandidates(input.accountId);
+    if (!input.fillSharedBatch && existingActiveCandidates > 0) {
+      return 0;
+    }
+    if (input.fillSharedBatch && existingActiveCandidates >= TOPIC_BATCH_SIZE) {
+      return 0;
+    }
+
     await this.topicRepository.reconcileAcceptedCandidateStatuses();
     await this.topicRepository.markAnsweredHistoryCandidates(input.accountId);
     const activeCandidates = await this.topicRepository.countActiveCandidates(input.accountId);
-    if (activeCandidates > 0) {
+    if (!input.fillSharedBatch && activeCandidates > 0) {
+      return 0;
+    }
+    if (input.fillSharedBatch && activeCandidates >= TOPIC_BATCH_SIZE) {
       return 0;
     }
 
@@ -139,23 +151,49 @@ export class TopicDiscoveryService {
       const pastTopicFingerprints = await this.topicRepository.getRecentPublishedTopicFingerprints(10, input.accountId);
       const discoveredCandidateIds = new Set<number>();
 
-      await this.browserSkillService.open(traceContext, {
-        url: `${getAppConfig().zhihuBaseUrl}/`
-      });
-      await this.browserSkillService.wait(traceContext, { ms: 1_500 });
-      const recommendedSnapshot = await this.browserSkillService.snapshot(traceContext);
-      remaining -= await this.captureQuestionLinks(
-        recommendedSnapshot.questionLinks,
-        "recommended_answer",
-        { page: "home_recommend", titleOnlySelection: true },
-        input.accountId,
-        discoveredCandidateIds,
-        remaining,
-        input.promptSnapshot,
-        pastTopicFingerprints,
-        input.accountContext,
-        input.accountSoulMarkdown
-      );
+      for (const keyword of getAppConfig().topicKeywords) {
+        if (remaining <= 0) {
+          break;
+        }
+
+        await this.browserSkillService.open(traceContext, {
+          url: `${getAppConfig().zhihuBaseUrl}/search?type=content&q=${encodeURIComponent(keyword)}`
+        });
+        await this.browserSkillService.wait(traceContext, { ms: 1_500 });
+        const snapshot = await this.browserSkillService.snapshot(traceContext);
+        remaining -= await this.captureQuestionLinks(
+          snapshot.questionLinks,
+          "keyword_search",
+          { keyword, titleOnlySelection: true },
+          input.accountId,
+          discoveredCandidateIds,
+          remaining,
+          input.promptSnapshot,
+          pastTopicFingerprints,
+          input.accountContext,
+          input.accountSoulMarkdown
+        );
+      }
+
+      if (remaining > 0) {
+        await this.browserSkillService.open(traceContext, {
+          url: `${getAppConfig().zhihuBaseUrl}/`
+        });
+        await this.browserSkillService.wait(traceContext, { ms: 1_500 });
+        const recommendedSnapshot = await this.browserSkillService.snapshot(traceContext);
+        remaining -= await this.captureQuestionLinks(
+          recommendedSnapshot.questionLinks,
+          "recommended_answer",
+          { page: "home_recommend", titleOnlySelection: true },
+          input.accountId,
+          discoveredCandidateIds,
+          remaining,
+          input.promptSnapshot,
+          pastTopicFingerprints,
+          input.accountContext,
+          input.accountSoulMarkdown
+        );
+      }
 
       if (remaining > 0) {
         await this.browserSkillService.open(traceContext, {
@@ -177,30 +215,7 @@ export class TopicDiscoveryService {
         );
       }
 
-      for (const keyword of getAppConfig().topicKeywords) {
-        if (remaining <= 0) {
-          break;
-        }
-
-        await this.browserSkillService.open(traceContext, {
-          url: `${getAppConfig().zhihuBaseUrl}/search?type=content&q=${encodeURIComponent(keyword)}`
-        });
-        await this.browserSkillService.wait(traceContext, { ms: 1_500 });
-        const snapshot = await this.browserSkillService.snapshot(traceContext);
-        remaining -= await this.captureQuestionLinks(
-          snapshot.questionLinks,
-          "keyword_search",
-          { keyword, titleOnlySelection: true },
-          input.accountId,
-          discoveredCandidateIds,
-          remaining,
-            input.promptSnapshot,
-            pastTopicFingerprints,
-            input.accountContext,
-            input.accountSoulMarkdown
-          );
-      }
-
+      await this.browserSkillService.closeSession(sessionKey);
       await this.keepTopTopicsAfterWideSelection({
         accountId: input.accountId,
         promptSnapshot: input.promptSnapshot,
@@ -256,6 +271,14 @@ export class TopicDiscoveryService {
       if (answeredTopic) {
         if (candidate.status !== "published") {
           await this.topicRepository.markCandidateDuplicate(candidate.id, answeredTopic.duplicateReason);
+        }
+        continue;
+      }
+
+      const claimedQuestion = await this.topicRepository.findClaimedQuestionByUrl(questionUrl, candidate.id);
+      if (claimedQuestion) {
+        if (candidate.status !== "published" && candidate.status !== "accepted") {
+          await this.topicRepository.markCandidateDuplicate(candidate.id, claimedQuestion.duplicateReason);
         }
         continue;
       }
@@ -378,11 +401,11 @@ export class TopicDiscoveryService {
     });
     const batchPrompt = `${basePrompt}
 
-Case-driven planning rule:
-1. For crypto, trading, altcoin, contract, strategy, backtesting, risk-control, trading-psychology, capital-size, and stable-profit topics, set writing_plan.should_use_cases=true by default unless the question is only a narrow factual definition.
-2. If sourceContext, backend case_research, user notes, title, or candidate context contains a concrete market case, price path, token path, liquidation story, or user-provided example, preserve it in recommended_angle or writing_plan.writer_notes for Writer.
-3. A usable case must include time/price path or market setup, why a retail trader enters, position or budget, long/short temptation, action deformation such as chasing/holding/stop-loss failure, result pressure, and review takeaway.
-4. User-provided examples are style/quality references, not reusable copy. Do not keep reusing the same token, same price path, same story arc, or same wording across different answers.
+案例规划：
+1. GPT / Claude Code 接入、API 中转/代理选型、成本控制、工具选型、AI 辅助编程工作流题，默认 writing_plan.should_use_cases=true，除非只是极窄定义题。
+2. 如果 sourceContext、后端 case_research、用户备注、标题或候选上下文里有具体项目故事、接入失败、迁移踩坑或用户给的例子，写进 recommended_angle 或 writing_plan.writer_notes，留给写作 Agent。
+3. 可用案例必须包含项目背景（个人项目/小团队/创业）、用了哪些模型、具体卡点（限流、超时、账单惊吓、迁移需求、访问不稳）、试过什么、最终怎么选、还剩什么局限。
+4. 用户给的范文只是文风/质量参考，不是可复用原文。不要在不同回答里反复用同一个项目故事、同一个模型名或同一套措辞。
 
 补充说明：
 1. 你现在执行的是 Topic Agent 的“批量标题预筛模式”，不是单题最终定稿模式。
@@ -393,27 +416,27 @@ Case-driven planning rule:
 6. priority 只对 validity_status = "valid" 的题目有实际意义；如果你认为该题无效，priority 统一输出 SKIP。
 7. 如果信息不足，但标题并不明显无效，你也可以保守输出 valid，并给较低 fit_score 与 P2。
 8. recommended_answer、invite_answer、keyword_search 都只是信号，不是硬规则。
-9. 选题覆盖要从 product.md、target.md 和 Account Soul 一起判断，不要只盯“量化/回测”关键词。
-10. 当前流程是“先海选，再二次筛选”。预筛阶段不要过早收窄，只要标题属于币圈、形态、AI交易、交易心态、风控复盘等可写范围，且不是明显无关/违规/极冷工程题，可以先 valid 进入海选池。
+9. 选题覆盖要从 product.md、target.md 和 Account Soul 一起判断，不要只盯固定关键词。
+10. 当前流程是“先海选，再二次筛选”。预筛阶段不要过早收窄，只要标题属于 AI 开发、API 接入、工具选型、开发者心态等可写范围，且不是明显无关/违规/极冷工程题，可以先 valid 进入海选池。
 11. 二次筛选会按流量潜力、产品/内容适配度、情绪强度、账号契合度保留前10。你的预筛输出也要体现这些判断。
-12. 内容重心放在币圈：炒币、合约、杠杆、山寨币、主流币、行情结构、K 线形态、交易心态、风控、复盘、踩坑和交易决策错误。
+12. 内容重心放在实际使用/想用 GPT、Claude Code 的开发者：官方接口访问不稳定、限流报错、账单/计费问题、接入方式选型、迁移评估、AI 辅助编程的实际使用体验。
 13. 在方向符合时，尽量选流量更高的题：痛点更大众、讨论空间更大、搜索需求更稳定、标题更像真实用户会点的问题，应优先于很冷、很窄、很工程化的问题。
-14. 情绪强的问题可以多保留，例如亏损、爆仓、追涨被套、不会止损、怕错过、合约上头、AI 交易焦虑、形态误判、一直亏还要不要坚持。这类题即使不软广，也能作为高价值内容。
-15. 形态识别/技术形态教学类题可以回复，也可以自然加入软广。重点是讲清形态如何识别、为什么容易误判、如何结合量价结构和历史数据验证，不要写成指标百科。
-16. AI 和交易联动类题可以回复，也可以自然加入软广。重点是 AI 辅助解释指标、生成策略条件、解读回测结果、发现风险点；严禁暗示 AI 能预测行情、喊单或替用户自动交易。
-17. 纯量化工作流不再作为有效选题方向。题目如果主要是在讨论量化工程流程、策略快速上线、深度优化、参数调优、研究 pipeline、团队研发效率，而不是币圈交易者的真实交易痛点，validity_status 应倾向 invalid 或 priority=SKIP。
-18. 泛交易心态题可以保留，例如外汇交易者为什么亏损、如何避免成为韭菜这类题；但必须把它当作交易经验分享题处理，重点讲人性、纪律、仓位、亏损路径和复盘，不要强行转成产品软广。
-19. 泛交易心态题默认 should_include_soft_promo=false、soft_promo_mode=none、topic_fingerprint.promo_entry=none，除非题目本身明确问工具、回测、监控、策略验证或复盘系统。
+14. 情绪强的问题可以多保留，例如被限流卡住、突然收到高额账单、官方接口说崩就崩、迁移踩坑、担心中转服务不靠谱、一直卡在环境配置上要不要放弃。这类题即使不软广，也能作为高价值内容。
+15. 工具对比/选型类题可以回复，也可以自然加入软广。重点是讲清官方直连 vs 中转/代理各自的适用场景和局限，不要写成产品测评合集。
+16. AI 辅助编程类题可以回复，也可以自然加入软广。重点是怎么把 Claude Code / GPT 用得更顺手、更稳定、更省钱；严禁暗示某个中转服务能保证 100% 可用或能绕过官方限制。
+17. 纯理论科普不再作为主要选题方向。题目如果主要是在讨论大模型原理、Prompt 工程理论、行业新闻，而不是开发者的真实访问/成本/稳定性痛点，validity_status 应倾向 invalid 或 priority=SKIP。
+18. 泛开发者工具心态题可以保留，例如怎么选编程助手、怎么看代码生成质量这类题；但必须把它当作开发经验分享题处理，重点讲取舍、踩坑和实际体验，不要强行转成产品软广。
+19. 泛开发者工具心态题默认 should_include_soft_promo=false、soft_promo_mode=none、topic_fingerprint.promo_entry=none，除非题目本身明确问 API 访问、成本控制或中转/代理服务。
 20. 软广需要有节奏，不要每条都带。整体按约 10 条里 7 条自然带产品、3 条纯分享/纯经验/纯观点来控制。
-21. 如果适合，把 should_include_soft_promo 设为 true，soft_promo_mode 设为 light 或 natural，并用 soft_promo_directive.writer_instruction 明确告诉 Writer 这篇需要自然加入 CryptoPathX。
-22. 如果不适合，把 should_include_soft_promo 设为 false，soft_promo_mode 设为 none，topic_fingerprint.promo_entry 写 none，并用 soft_promo_directive.writer_instruction 告诉 Writer 不强制加入软广，不要硬带 CryptoPathX。
-23. 只有当 CryptoPathX 的真实能力能解决标题里的具体一步时，才允许 should_include_soft_promo=true；不要因为业务目标需要推广就默认每篇都带。
+21. 如果适合，把 should_include_soft_promo 设为 true，soft_promo_mode 设为 light 或 natural，并用 soft_promo_directive.writer_instruction 明确告诉 Writer 这篇需要自然加入 Dudu 中转站。
+22. 如果不适合，把 should_include_soft_promo 设为 false，soft_promo_mode 设为 none，topic_fingerprint.promo_entry 写 none，并用 soft_promo_directive.writer_instruction 告诉 Writer 不强制加入软广，不要硬带 Dudu 中转站。
+23. 只有当 Dudu 中转站的真实能力能解决标题里的具体一步时，才允许 should_include_soft_promo=true；不要因为业务目标需要推广就默认每篇都带。
 24. 必须为每个有效选题输出 writing_plan，决定正文长度、是否需要案例、是否需要算账、是否适合列表/短标题、哪些重点需要加粗。
-25. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；交易经历、弯路复盘、新手入门、小本金、策略方法论、软文承接空间大的题用 long。
+25. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；开发经历、弯路复盘、新手入门、成本优化、工具选型方法论、软文承接空间大的题用 long。
 26. 字数规则：target_words_min 是 Writer 必须达到的硬下限；target_words_max 只是软参考，可以超过，不能为了压字数牺牲案例、算账和信息密度。
-27. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实朋友经历。
-28. 数据规则：案例里的胜率、回撤、盈亏比、仓位、手续费、滑点等数字要贴近真实市场常识、保守且自洽，不要要求精确历史统计。
-29. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、算账结论、操作原则、产品边界。
+27. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实项目经历。
+28. 数据规则：案例里的调用量、并发数、月账单、限流次数等数字要贴近真实开发场景常识、保守且自洽，不要要求精确历史统计。
+29. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、成本结论、操作原则、产品边界。
 30. suggested_sections 是结构提示，不是要求 Writer 原样使用的标题；避免反复输出“先说结论/最后补一句”这类固定模板。
 31. 你必须为每个 candidate_id 输出且只输出一次结果。
 32. 只输出 JSON，不要解释，不要 Markdown。
@@ -429,7 +452,7 @@ Case-driven planning rule:
       "summary": "100-180字选题摘要",
       "priority": "P0 | P1 | P2 | SKIP",
       "fit_score": 0,
-      "question_type": "工具推荐 | 方法验证 | 入门认知 | 行情判断 | 风险管理 | 策略构建 | 纯干货 | 其他",
+      "question_type": "工具推荐 | 方法验证 | 入门认知 | 选型对比 | 成本优化 | 稳定性排查 | 纯干货 | 其他",
       "persona_mode": "二牛实测型 | 二牛踩坑型 | 二牛对比型 | 二牛经验型",
       "target_audience": ["目标读者1"],
       "pain_points": ["痛点1"],
@@ -698,25 +721,16 @@ function normalizeStringArray(value: unknown) {
     : [];
 }
 
+// 2026-09 产品定位从 CryptoPathX 切换为 dudu 中转站后，这里的正则也从
+// "币圈/交易术语" 换成 "大模型 API 接入/中转相关术语"，用来判断某个选题是否
+// 需要走"案例驱动"的写作默认值（更长篇幅、要求带具体案例）。
 const CASE_DRIVEN_TOPIC_PATTERNS = [
-  /\u5e01\u5708/u,
-  /\u7092\u5e01/u,
-  /\u5c71\u5be8\u5e01/u,
-  /\u52a0\u5bc6\u8d27\u5e01/u,
-  /\u4ea4\u6613/u,
-  /\u91cf\u5316/u,
-  /\u7b56\u7565/u,
-  /\u56de\u6d4b/u,
-  /\u5408\u7ea6/u,
-  /\u6760\u6746/u,
-  /\u4ed3\u4f4d/u,
-  /\u6b62\u635f/u,
-  /\u505a\u591a|\u505a\u7a7a/u,
-  /\u5fc3\u6001/u,
-  /\u5f2f\u8def/u,
-  /\u7a33\u5b9a\u76c8\u5229/u,
-  /\u76c8\u4e8f|\u56de\u64a4|\u6ed1\u70b9|\u7206\u4ed3/u,
-  /\b(?:BTC|ETH|Crypto|RSI|MACD|K\u7ebf|U)\b/iu
+  /gpt/iu,
+  /claude/iu,
+  /codex/iu,
+  /openrouter/iu,
+  /\u5927\u6a21\u578b|\u4e2d\u8f6c|\u4ee3\u7406|\u9650\u6d41|\u63a5\u5165|\u90e8\u7f72|\u8c03\u7528|\u8ba1\u8d39|\u8d26\u5355|\u5c01\u53f7|\u98ce\u63a7/u,
+  /\bAPI\b|\bSDK\b|\bToken\b/iu
 ];
 
 function shouldUseCaseDrivenDefaults(seedText: string) {
@@ -725,12 +739,12 @@ function shouldUseCaseDrivenDefaults(seedText: string) {
 
 function appendCaseWriterNote(existing: string) {
   const note =
-    "Case-driven default: for crypto/trading topics, make at least one concrete case carry the core argument. Prefer source/user-provided cases or backend case_research when available; otherwise use a realistic composite case with price/time path, entry trigger, position or budget, long/short temptation, stop-loss/action deformation, outcome pressure, and review takeaway. Do not keep reusing the same token, story arc, or reference wording across different answers.";
+    "案例驱动默认：开发者/API 接入/工具选题里，至少用一个具体案例承担核心论证。优先用来源材料、用户提供案例或后端 case_research；没有的话就写接近真实的复合案例，包含项目背景、具体卡点（限流、超时、账单惊吓、迁移需求、访问不稳）、试过什么、最终怎么选、还剩什么局限。不要在不同回答里反复用同一个项目故事、模型名或参考原文。";
 
   if (!existing) {
     return note;
   }
-  if (existing.includes("Case-driven default")) {
+  if (existing.includes("案例驱动默认")) {
     return existing;
   }
   return `${existing}\n${note}`;
@@ -929,11 +943,11 @@ function buildSoftPromoWriterInstruction(input: {
   productAnchor: string;
 }) {
   if (!input.shouldInclude) {
-    return "Topic Agent 判断该选题不适合强制加入软广。Writer 应优先把问题回答完整，不要为了推广硬带 CryptoPathX。";
+    return "Topic Agent 判断该选题不适合强制加入软广。Writer 应优先把问题回答完整，不要为了推广硬带 Dudu 中转站。";
   }
 
   const anchor = input.productAnchor ? `承接点：${input.productAnchor}。` : "";
-  return `Topic Agent 判断该选题适合自然加入软广，Writer 需要在不破坏回答价值的前提下自然提到 CryptoPathX。${anchor}原因：${input.reason}`;
+  return `Topic Agent 判断该选题适合自然加入软广，Writer 需要在不破坏回答价值的前提下自然提到 Dudu 中转站。${anchor}原因：${input.reason}`;
 }
 
 function normalizeValidityStatus(value: unknown, fallback: TopicValidityStatus): TopicValidityStatus {

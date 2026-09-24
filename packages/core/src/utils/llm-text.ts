@@ -39,14 +39,22 @@ export async function createLlmTextResponse(
           throw error;
         }
 
-        return client.chat.completions.create(
-          {
-            model: runtime.model,
-            messages
-          },
-          {
-            timeout: runtime.requestTimeoutMs
-          }
+        // 有些中转渠道只代理了流式接口，非流式请求会一直挂起不返回、也不报错。
+        // openai SDK 自带的 timeout 选项在这类渠道上并不总是生效，这里用一个独立的
+        // Promise.race 兜底，保证即便渠道真的"卡住不返回"，也能在有限时间内报错重试，
+        // 而不是无限期挂起整个 worker tick。
+        return raceWithTimeout(
+          client.chat.completions.create(
+            {
+              model: runtime.model,
+              messages
+            },
+            {
+              timeout: runtime.requestTimeoutMs
+            }
+          ),
+          initialResponseTimeoutMs,
+          `LLM non-streaming fallback timeout after ${initialResponseTimeoutMs}ms (channel may not support non-streaming requests).`
         );
       }
     }
@@ -61,17 +69,40 @@ export async function createLlmTextResponse(
         throw error;
       }
 
-      return client.responses.create(
-        {
-          model: runtime.model,
-          reasoning: { effort: runtime.reasoningEffort },
-          input: messages
-        },
-        {
-          timeout: runtime.requestTimeoutMs
-        }
+      return raceWithTimeout(
+        client.responses.create(
+          {
+            model: runtime.model,
+            reasoning: { effort: runtime.reasoningEffort },
+            input: messages
+          },
+          {
+            timeout: runtime.requestTimeoutMs
+          }
+        ),
+        initialResponseTimeoutMs,
+        `LLM non-streaming fallback timeout after ${initialResponseTimeoutMs}ms (channel may not support non-streaming requests).`
       );
     }
+  });
+}
+
+function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(message));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
   });
 }
 
@@ -293,7 +324,7 @@ function isRetryableError(input: ReturnType<typeof extractErrorDiagnostics>) {
     return true;
   }
 
-  if (input.code && ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"].includes(input.code)) {
+  if (input.code && ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN", "upstream_stream_read_error", "stream_read_error"].includes(input.code)) {
     return true;
   }
 
@@ -303,7 +334,9 @@ function isRetryableError(input: ReturnType<typeof extractErrorDiagnostics>) {
     text.includes("fetch failed") ||
     text.includes("timeout") ||
     text.includes("network") ||
-    text.includes("temporarily unavailable")
+    text.includes("temporarily unavailable") ||
+    text.includes("stream was interrupted") ||
+    text.includes("stream_read_error")
   );
 }
 

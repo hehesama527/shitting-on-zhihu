@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { launchPersistentContext } from "cloakbrowser";
+import type { BrowserContext, Page } from "playwright";
 import { getXAppConfig, type XAppConfig } from "../config.js";
 import type { XAccount } from "../types.js";
 import { getStealthInitScripts, getProfileUserAgent, validateFingerprintConsistency } from "../../../core/src/utils/stealth-inject.js";
@@ -285,7 +286,7 @@ export class XBrowserRuntime {
     const resolvedProfileDir = path.isAbsolute(profileDir)
       ? profileDir
       : path.join(this.config.browserProfileRoot, profileDir);
-    const resolvedProxyUrl = normalizeOptionalValue(proxyUrl) ?? this.config.browserProxyUrl;
+    const resolvedProxyUrl = normalizeOptionalValue(proxyUrl) ?? this.config.browserProxyUrl ?? 'http://127.0.0.1:7890';
     const resolvedHeadless = options?.headless ?? this.config.browserHeadless;
 
     const existing = this.sessions.get(sessionKey);
@@ -335,11 +336,10 @@ export class XBrowserRuntime {
       ] : ["--start-maximized", "--disable-blink-features=AutomationControlled"];
 
       const launchOptions: any = {
-        channel: this.config.browserChannel,
+        userDataDir: resolvedProfileDir,
         headless: resolvedHeadless,
         viewport: null,
-        ignoreDefaultArgs: ["--enable-automation"],
-        proxy: resolvedProxyUrl ? { server: resolvedProxyUrl } : undefined,
+        proxy: resolvedProxyUrl ? resolvedProxyUrl : undefined,
         args: stealthArgs,
       };
 
@@ -350,7 +350,7 @@ export class XBrowserRuntime {
         launchOptions.timezoneId = "America/New_York";
       }
 
-      const context = await chromium.launchPersistentContext(resolvedProfileDir, launchOptions);
+      const context = (await launchPersistentContext(launchOptions)) as unknown as BrowserContext;
 
       const page = context.pages()[0] ?? (await context.newPage());
 
@@ -497,7 +497,7 @@ export class XBrowserRuntime {
     const scrollCount = 2 + Math.floor(Math.random() * 3);
     for (let i = 0; i < scrollCount; i++) {
       const scrollY = 80 + Math.random() * 180; // Positive scroll (reading down)
-      await page.evaluate((y) => window.scrollBy(0, y), scrollY);
+      await page.evaluate((y: number) => window.scrollBy(0, y), scrollY);
       // Reading pause proportional to scroll amount
       await humanWait(400 + scrollY * 3 + Math.random() * 300, true);
     }

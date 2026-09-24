@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 import os from 'os';
 
@@ -24,15 +24,14 @@ async function manualLoginZhihu() {
   console.log('5. 登录成功后我们再重新测试 Note Agent 采集\n');
 
   try {
-    const browser = await chromium.launchPersistentContext(profileDir, {
+    const browser = await launchPersistentContext({
+      userDataDir: profileDir,
       headless: false,
-      channel: 'msedge',  // Windows 上优先用 Edge
       viewport: { width: 1440, height: 960 },
       args: [
         '--start-maximized',
         '--no-first-run',
         '--no-default-browser-check',
-        '--disable-blink-features=AutomationControlled',
         '--lang=zh-CN',
       ],
       locale: 'zh-CN',

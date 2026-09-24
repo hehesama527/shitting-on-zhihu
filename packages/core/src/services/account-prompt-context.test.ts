@@ -20,10 +20,10 @@ test("target/product suffixes inject business context without turning it into ex
   const writerSuffix = buildWriterTargetProductPromptSuffix(context);
   const reviewSuffix = buildReviewTargetProductPromptSuffix(context);
 
-  assert.match(topicSuffix ?? "", /Topic Agent usage/);
-  assert.match(writerSuffix ?? "", /Writer Agent usage/);
-  assert.match(reviewSuffix ?? "", /Review Agent usage/);
-  assert.match(writerSuffix ?? "", /not RAG, examples, style samples/);
+  assert.match(topicSuffix ?? "", /选题 Agent 用法/);
+  assert.match(writerSuffix ?? "", /写作 Agent 用法/);
+  assert.match(reviewSuffix ?? "", /审核 Agent 用法/);
+  assert.match(writerSuffix ?? "", /不是检索材料、范文、文风样本或来源素材/);
   assert.match(reviewSuffix ?? "", /guaranteed profit/);
 });
 

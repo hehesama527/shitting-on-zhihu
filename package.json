@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @zhihu-mvp/shared && npm run build -w @zhihu-mvp/core && npm run build -w @zhihu-mvp/x-core && npm run build -w @zhihu-mvp/x-traditional-core && npm run build -w @zhihu-mvp/api && npm run build -w @zhihu-mvp/control-api && npm run build -w @zhihu-mvp/hotspot-api && npm run build -w @zhihu-mvp/x-api && npm run build -w @zhihu-mvp/x-traditional-api && npm run build -w @zhihu-mvp/worker && npm run build -w @zhihu-mvp/x-worker && npm run build -w @zhihu-mvp/x-traditional-worker && npm run build -w @zhihu-mvp/ops-agent && npm run build -w @zhihu-mvp/web",
+    "build": "npm run build -w @zhihu-mvp/shared && npm run build -w @zhihu-mvp/core && npm run build -w @zhihu-mvp/video-renderer && npm run build -w @zhihu-mvp/hyperframe-local && npm run build -w @zhihu-mvp/x-core && npm run build -w @zhihu-mvp/x-traditional-core && npm run build -w @zhihu-mvp/api && npm run build -w @zhihu-mvp/control-api && npm run build -w @zhihu-mvp/hotspot-api && npm run build -w @zhihu-mvp/x-api && npm run build -w @zhihu-mvp/x-traditional-api && npm run build -w @zhihu-mvp/worker && npm run build -w @zhihu-mvp/x-worker && npm run build -w @zhihu-mvp/x-traditional-worker && npm run build -w @zhihu-mvp/ops-agent && npm run build -w @zhihu-mvp/web",
     "dev": "concurrently -n API,CONTROL,HOTSPOT,WORKER,OPS,WEB -c blue,magenta,yellow,cyan,white,green \"npm run dev -w @zhihu-mvp/api\" \"npm run dev -w @zhihu-mvp/control-api\" \"npm run dev -w @zhihu-mvp/hotspot-api\" \"npm run dev -w @zhihu-mvp/worker\" \"npm run dev -w @zhihu-mvp/ops-agent\" \"npm run dev -w @zhihu-mvp/web\"",
     "dev:x": "concurrently -n HOTSPOT,XMAINAPI,XMAINWORKER,WEB -c yellow,blue,red,green \"npm run dev -w @zhihu-mvp/hotspot-api\" \"npm run dev -w @zhihu-mvp/x-api\" \"npm run dev -w @zhihu-mvp/x-worker\" \"npm run dev -w @zhihu-mvp/web\"",
     "dev:x-main": "concurrently -n HOTSPOT,XMAINAPI,XMAINWORKER,WEB -c yellow,blue,red,green \"npm run dev -w @zhihu-mvp/hotspot-api\" \"npm run dev -w @zhihu-mvp/x-api\" \"npm run dev -w @zhihu-mvp/x-worker\" \"npm run dev -w @zhihu-mvp/web\"",
@@ -15,15 +15,20 @@
     "dev:x-all": "concurrently -n HOTSPOT,XMAINAPI,XMAINWORKER,XTRADAPI,XTRADWORKER,WEB -c yellow,blue,red,magenta,cyan,green \"npm run dev -w @zhihu-mvp/hotspot-api\" \"npm run dev -w @zhihu-mvp/x-api\" \"npm run dev -w @zhihu-mvp/x-worker\" \"npm run dev -w @zhihu-mvp/x-traditional-api\" \"npm run dev -w @zhihu-mvp/x-traditional-worker\" \"npm run dev -w @zhihu-mvp/web\"",
     "dev:backend": "concurrently -n API,CONTROL,HOTSPOT,WORKER,OPS -c blue,magenta,yellow,cyan,white \"npm run dev -w @zhihu-mvp/api\" \"npm run dev -w @zhihu-mvp/control-api\" \"npm run dev -w @zhihu-mvp/hotspot-api\" \"npm run dev -w @zhihu-mvp/worker\" \"npm run dev -w @zhihu-mvp/ops-agent\"",
     "dev:frontend": "npm run dev -w @zhihu-mvp/web",
+    "dev:hyperframe-local": "npm run dev -w @zhihu-mvp/hyperframe-local",
     "x:check-readiness": "node ./check-x-browser-readiness.mjs",
     "db:init": "npm run db:init -w @zhihu-mvp/api",
     "lint": "npm run lint -w @zhihu-mvp/web",
-    "typecheck": "npm run typecheck -w @zhihu-mvp/shared && npm run typecheck -w @zhihu-mvp/core && npm run typecheck -w @zhihu-mvp/x-core && npm run typecheck -w @zhihu-mvp/x-traditional-core && npm run typecheck -w @zhihu-mvp/api && npm run typecheck -w @zhihu-mvp/control-api && npm run typecheck -w @zhihu-mvp/hotspot-api && npm run typecheck -w @zhihu-mvp/x-api && npm run typecheck -w @zhihu-mvp/x-traditional-api && npm run typecheck -w @zhihu-mvp/worker && npm run typecheck -w @zhihu-mvp/x-worker && npm run typecheck -w @zhihu-mvp/x-traditional-worker && npm run typecheck -w @zhihu-mvp/ops-agent && npm run typecheck -w @zhihu-mvp/web"
+    "typecheck": "npm run typecheck -w @zhihu-mvp/shared && npm run typecheck -w @zhihu-mvp/core && npm run typecheck -w @zhihu-mvp/video-renderer && npm run typecheck -w @zhihu-mvp/hyperframe-local && npm run typecheck -w @zhihu-mvp/x-core && npm run typecheck -w @zhihu-mvp/x-traditional-core && npm run typecheck -w @zhihu-mvp/api && npm run typecheck -w @zhihu-mvp/control-api && npm run typecheck -w @zhihu-mvp/hotspot-api && npm run typecheck -w @zhihu-mvp/x-api && npm run typecheck -w @zhihu-mvp/x-traditional-api && npm run typecheck -w @zhihu-mvp/worker && npm run typecheck -w @zhihu-mvp/x-worker && npm run typecheck -w @zhihu-mvp/x-traditional-worker && npm run typecheck -w @zhihu-mvp/ops-agent && npm run typecheck -w @zhihu-mvp/web"
   },
   "devDependencies": {
     "@types/node": "^24.0.3",
     "concurrently": "^9.1.2",
     "pm2": "^6.0.14",
     "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.3.28",
+    "playwright-core": "^1.60.0"
   }
 }

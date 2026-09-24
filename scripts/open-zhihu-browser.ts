@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { launch, launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 
 const ACCOUNT = '31-76-72-14-98';
@@ -15,21 +15,18 @@ async function openVisibleBrowser() {
   console.log('🟢 如果浏览器没有弹出，请检查任务栏或告诉我，我会换用 Chrome 强制启动。\n');
 
   try {
-    const browser = await chromium.launchPersistentContext(userDataDir, {
-      headless: false,           // 明确有头
-      channel: 'msedge',         // 先尝试 Edge
+    const browser = await launchPersistentContext({
+      userDataDir,
+      headless: false,
       viewport: { width: 1440, height: 960 },
       args: [
         '--start-maximized',
         '--no-first-run',
         '--no-default-browser-check',
-        '--disable-blink-features=AutomationControlled',
         '--lang=zh-CN',
-        '--disable-features=IsolateOrigins,site-per-process',
       ],
       locale: 'zh-CN',
       timezoneId: 'Asia/Shanghai',
-      ignoreDefaultArgs: ['--enable-automation'],
     });
 
     const page = browser.pages()[0] || await browser.newPage();
@@ -64,9 +61,8 @@ async function openVisibleBrowser() {
 
     // 失败后尝试 Chrome
     try {
-      const browser = await chromium.launch({
+      const browser = await launch({
         headless: false,
-        channel: 'chrome',
         args: ['--start-maximized', '--no-first-run']
       });
       const page = await browser.newPage();

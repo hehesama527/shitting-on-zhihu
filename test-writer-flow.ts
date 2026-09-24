@@ -2,7 +2,7 @@
  * 模拟发布流程，检查账号在 writer 阶段的问题
  */
 
-import { chromium } from "playwright";
+import { launchPersistentContext } from "cloakbrowser";
 import path from "node:path";
 
 const ACCOUNTS = [
@@ -21,11 +21,10 @@ async function testPublishFlow(account: typeof ACCOUNTS[0]) {
   
   let browser: any = null;
   try {
-    browser = await chromium.launchPersistentContext(profileDir, {
-      channel: "msedge",
-      headless: false, // 使用有头模式以便观察
+    browser = await launchPersistentContext({
+      userDataDir: profileDir,
+      headless: false,
       viewport: { width: 1280, height: 720 },
-      args: ["--disable-blink-features=AutomationControlled"]
     });
     
     const page = browser.pages()[0] ?? (await browser.newPage());

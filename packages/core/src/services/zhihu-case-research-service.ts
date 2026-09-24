@@ -7,44 +7,43 @@ const MAX_RAW_MATERIALS = 36;
 
 const NEWS_FEEDS = [
   {
-    label: "BlockBeats RSS",
-    url: "https://api.theblockbeats.news/v1/open-api/home-xml",
+    label: "OpenAI News RSS",
+    url: "https://openai.com/news/rss.xml",
     limit: 12
   },
   {
-    label: "Cointelegraph RSS",
-    url: "https://cointelegraph.com/rss",
+    label: "OpenAI Developers RSS",
+    url: "https://developers.openai.com/rss.xml",
     limit: 10
   },
   {
-    label: "Decrypt RSS",
-    url: "https://decrypt.co/feed",
-    limit: 10
-  },
-  {
-    label: "Bitcoin Magazine RSS",
-    url: "https://www.bitcoinmagazine.com/.rss/full/",
+    label: "OpenAI Engineering RSS",
+    url: "https://openai.com/news/engineering/rss.xml",
     limit: 8
   }
 ] as const;
 
+const STATUS_SOURCES = [
+  {
+    label: "OpenAI Status",
+    url: "https://status.openai.com/api/v2/incidents.json",
+    pageUrl: "https://status.openai.com"
+  },
+  {
+    label: "Anthropic Status",
+    url: "https://status.anthropic.com/api/v2/incidents.json",
+    pageUrl: "https://status.anthropic.com"
+  }
+] as const;
+
 const CASE_RESEARCH_TOPIC_PATTERNS = [
-  /\u5e01\u5708/u,
-  /\u7092\u5e01/u,
-  /\u5c71\u5be8\u5e01/u,
-  /\u52a0\u5bc6\u8d27\u5e01/u,
-  /\u4ea4\u6613/u,
-  /\u91cf\u5316/u,
-  /\u7b56\u7565/u,
-  /\u56de\u6d4b/u,
-  /\u5408\u7ea6/u,
-  /\u6760\u6746/u,
-  /\u4ed3\u4f4d/u,
-  /\u6b62\u635f/u,
-  /\u505a\u591a|\u505a\u7a7a/u,
-  /\u5fc3\u6001/u,
-  /\u7a33\u5b9a\u76c8\u5229/u,
-  /crypto|bitcoin|btc|eth|altcoin|memecoin|token|trading|backtest|strategy|leverage/i
+  /gpt/iu,
+  /claude/iu,
+  /codex/iu,
+  /openrouter/iu,
+  /openai|anthropic/iu,
+  /\u5927\u6a21\u578b|\u4e2d\u8f6c|\u4ee3\u7406|\u9650\u6d41|\u63a5\u5165|\u90e8\u7f72|\u8c03\u7528|\u8ba1\u8d39|\u8d26\u5355|\u5c01\u53f7|\u98ce\u63a7/u,
+  /\bAPI\b|\bSDK\b|\bToken\b|\b429\b/iu
 ];
 
 type RawCaseMaterial = {
@@ -99,26 +98,19 @@ type ParsedRssItem = {
   publishedAt: string | null;
 };
 
-type BinanceTicker24h = {
-  symbol: string;
-  lastPrice: string;
-  priceChangePercent: string;
-  highPrice: string;
-  lowPrice: string;
-  volume: string;
-  quoteVolume?: string;
-};
-
-type CoinGeckoMarket = {
-  id: string;
-  symbol: string;
-  name: string;
-  current_price: number | null;
-  high_24h: number | null;
-  low_24h: number | null;
-  total_volume: number | null;
-  price_change_percentage_24h: number | null;
-  market_cap_rank: number | null;
+type StatuspageIncidentsResponse = {
+  incidents?: Array<{
+    name?: string;
+    status?: string;
+    shortlink?: string;
+    created_at?: string;
+    updated_at?: string;
+    incident_updates?: Array<{
+      body?: string;
+      status?: string;
+      created_at?: string;
+    }>;
+  }>;
 };
 
 export class ZhihuCaseResearchService {
@@ -261,126 +253,51 @@ async function collectNewsMaterials() {
       title: item.title,
       summary: item.summary,
       published_at: item.publishedAt,
-      symbols: extractCryptoSymbols(`${item.title}\n${item.summary}`),
+      symbols: extractTopicSymbols(`${item.title}\n${item.summary}`),
       metrics: {}
     }))
   };
 }
 
 async function collectMarketMaterials() {
+  const settled = await Promise.allSettled(STATUS_SOURCES.map((source) => collectStatusIncidents(source)));
   const failedSources: string[] = [];
+  const materials: RawCaseMaterial[] = [];
 
-  try {
-    const materials = await collectBinanceMarketMaterials();
-    if (materials.length > 0) {
-      return {
-        failedSources,
-        materials
-      };
+  for (const [index, result] of settled.entries()) {
+    if (result.status === "fulfilled") {
+      materials.push(...result.value);
+      continue;
     }
-  } catch (error) {
-    failedSources.push(`Binance 24h ticker: ${toErrorMessage(error)}`);
+    failedSources.push(`${STATUS_SOURCES[index].label}: ${toErrorMessage(result.reason)}`);
   }
 
-  try {
-    const materials = await collectCoinGeckoMarketMaterials();
-    return {
-      failedSources,
-      materials
-    };
-  } catch (error) {
-    failedSources.push(`CoinGecko markets: ${toErrorMessage(error)}`);
-    return {
-      failedSources,
-      materials: []
-    };
-  }
+  return { failedSources, materials };
 }
 
-async function collectBinanceMarketMaterials() {
-  const tickers = await fetchJson<BinanceTicker24h[]>("https://api.binance.com/api/v3/ticker/24hr");
-  return tickers
-    .filter((ticker) => isUsdtSpotSymbol(ticker.symbol))
-    .map((ticker) => ({
-      ticker,
-      changePercent: Number(ticker.priceChangePercent),
-      quoteVolume: Number(ticker.quoteVolume ?? "0")
-    }))
-    .filter((item) => Number.isFinite(item.changePercent) && Number.isFinite(item.quoteVolume))
-    .sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent))
-    .slice(0, 18)
-    .map<RawCaseMaterial>(({ ticker, changePercent, quoteVolume }) => ({
-      source_type: "market",
-      source_label: "Binance 24h ticker",
-      source_url: "",
-      title: `${ticker.symbol} 24h move ${changePercent >= 0 ? "+" : ""}${changePercent.toFixed(2)}%`,
-      summary: [
-        `last=${ticker.lastPrice}`,
-        `high=${ticker.highPrice}`,
-        `low=${ticker.lowPrice}`,
-        `volume=${ticker.volume}`,
-        `quoteVolume=${Number.isFinite(quoteVolume) ? quoteVolume.toFixed(0) : "unknown"}`
-      ].join(" | "),
-      published_at: new Date().toISOString(),
-      symbols: [ticker.symbol.replace(/USDT$/i, "")],
-      metrics: {
-        symbol: ticker.symbol,
-        lastPrice: ticker.lastPrice,
-        highPrice: ticker.highPrice,
-        lowPrice: ticker.lowPrice,
-        priceChangePercent: changePercent,
-        volume: ticker.volume,
-        quoteVolume: ticker.quoteVolume ?? null
-      }
-    }));
-}
+async function collectStatusIncidents(source: (typeof STATUS_SOURCES)[number]) {
+  const payload = await fetchJson<StatuspageIncidentsResponse>(source.url);
+  const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
 
-async function collectCoinGeckoMarketMaterials() {
-  const url = [
-    "https://api.coingecko.com/api/v3/coins/markets",
-    "?vs_currency=usd",
-    "&order=market_cap_desc",
-    "&per_page=80",
-    "&page=1",
-    "&sparkline=false",
-    "&price_change_percentage=24h"
-  ].join("");
-  const tickers = await fetchJson<CoinGeckoMarket[]>(url);
+  return incidents.slice(0, 8).map<RawCaseMaterial>((incident) => {
+    const latestUpdate = Array.isArray(incident.incident_updates) ? incident.incident_updates[0] : null;
+    const title = pickString(incident.name, `${source.label} incident`);
+    const summary = pickString(latestUpdate?.body, incident.status, title);
 
-  return tickers
-    .map((ticker) => ({
-      ticker,
-      changePercent: Number(ticker.price_change_percentage_24h ?? 0),
-      volume: Number(ticker.total_volume ?? 0)
-    }))
-    .filter((item) => Number.isFinite(item.changePercent) && Number.isFinite(item.volume))
-    .sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent))
-    .slice(0, 18)
-    .map<RawCaseMaterial>(({ ticker, changePercent, volume }) => ({
+    return {
       source_type: "market",
-      source_label: "CoinGecko markets",
-      source_url: `https://www.coingecko.com/en/coins/${ticker.id}`,
-      title: `${ticker.name} (${ticker.symbol.toUpperCase()}) 24h move ${changePercent >= 0 ? "+" : ""}${changePercent.toFixed(2)}%`,
-      summary: [
-        `current=${formatMetric(ticker.current_price)}`,
-        `high_24h=${formatMetric(ticker.high_24h)}`,
-        `low_24h=${formatMetric(ticker.low_24h)}`,
-        `volume=${Number.isFinite(volume) ? volume.toFixed(0) : "unknown"}`,
-        `market_cap_rank=${ticker.market_cap_rank ?? "unknown"}`
-      ].join(" | "),
-      published_at: new Date().toISOString(),
-      symbols: [ticker.symbol.toUpperCase()],
+      source_label: source.label,
+      source_url: pickString(incident.shortlink, source.pageUrl) || source.pageUrl,
+      title,
+      summary,
+      published_at: pickString(incident.updated_at, incident.created_at, latestUpdate?.created_at) || null,
+      symbols: extractTopicSymbols(`${title}\n${summary}`),
       metrics: {
-        id: ticker.id,
-        symbol: ticker.symbol.toUpperCase(),
-        currentPrice: ticker.current_price,
-        high24h: ticker.high_24h,
-        low24h: ticker.low_24h,
-        priceChangePercent24h: changePercent,
-        volume,
-        marketCapRank: ticker.market_cap_rank
+        incidentStatus: incident.status ?? null,
+        updateStatus: latestUpdate?.status ?? null
       }
-    }));
+    };
+  });
 }
 
 function collectSourceContextMaterials(sourceContext?: Record<string, unknown> | null): RawCaseMaterial[] {
@@ -408,7 +325,7 @@ function collectSourceContextMaterials(sourceContext?: Record<string, unknown> |
       title: title || `source_context_${index + 1}`,
       summary,
       published_at: pickString(record.discoveredAt, metadata.publishedAt, metadata.createdAt) || null,
-      symbols: extractCryptoSymbols(`${title}\n${summary}`),
+      symbols: extractTopicSymbols(`${title}\n${summary}`),
       metrics: {}
     });
   }
@@ -422,7 +339,7 @@ function selectRelevantMaterials(questionTitle: string, materials: RawCaseMateri
       material,
       score: scoreMaterial(questionTitle, material)
     }))
-    .filter((item) => item.score > 0 || item.material.source_type === "market")
+    .filter((item) => item.score > 0 || item.material.source_type === "source_context")
     .sort((a, b) => b.score - a.score)
     .map((item) => item.material)
     .slice(0, MAX_RAW_MATERIALS);
@@ -434,28 +351,24 @@ function scoreMaterial(questionTitle: string, material: RawCaseMaterial) {
   let score = 0;
 
   const genericTerms = [
-    "crypto",
-    "bitcoin",
-    "btc",
-    "eth",
-    "altcoin",
-    "memecoin",
-    "meme coin",
+    "gpt",
+    "claude",
+    "codex",
+    "openai",
+    "anthropic",
+    "openrouter",
+    "api",
+    "rate limit",
+    "429",
+    "outage",
+    "billing",
     "token",
-    "trading",
-    "leverage",
-    "liquidation",
-    "volatility",
-    "pump",
-    "dump",
-    "rug",
-    "binance",
-    "\u5e01",
-    "\u5c71\u5be8",
-    "\u5408\u7ea6",
-    "\u7206\u4ed3",
-    "\u62c9\u76d8",
-    "\u4e0b\u8dcc"
+    "sdk",
+    "\u4e2d\u8f6c",
+    "\u9650\u6d41",
+    "\u8d26\u5355",
+    "\u63a5\u5165",
+    "\u8c03\u7528"
   ];
 
   for (const term of genericTerms) {
@@ -475,17 +388,8 @@ function scoreMaterial(questionTitle: string, material: RawCaseMaterial) {
     }
   }
 
-  if (question.includes("\u5c71\u5be8") || question.includes("altcoin")) {
-    for (const term of ["altcoin", "memecoin", "token", "pump", "dump", "liquidity", "low cap", "\u5c71\u5be8"]) {
-      if (text.includes(term)) {
-        score += 5;
-      }
-    }
-  }
-
   if (material.source_type === "market") {
-    const change = Number(material.metrics.priceChangePercent ?? 0);
-    score += Math.min(8, Math.abs(change) / 4);
+    score += 3;
   }
 
   return score;
@@ -493,15 +397,20 @@ function scoreMaterial(questionTitle: string, material: RawCaseMaterial) {
 
 function buildCaseResearchPrompt() {
   return [
-    "You are Zhihu Case Research Agent in the backend workflow.",
-    "Your job is not to write the article. Your job is to turn backend-collected source material into case materials that Writer Agent can use.",
-    "Use only facts present in raw_materials for source-backed cases. Do not invent exact facts for rss/market/source_context materials.",
-    "If source material is weak, create one clearly typical/composite case as source_type=composite_hint with low confidence.",
-    "Never copy article wording from RSS descriptions. Paraphrase only.",
-    "Prefer concrete case action chains: time/price path or market setup, why a retail trader enters, position/budget range, long/short temptation, action deformation, outcome pressure, and review takeaway.",
-    "Use cautious wording. Do not claim price prediction, guaranteed profit, insider knowledge, or verified personal trading records.",
-    "Use Simplified Chinese for narrative fields.",
-    "Return JSON only with this shape:",
+    "你是知乎发布链路里的案例研究 Agent，只负责把后端收集到的材料整理成写作 Agent 能用的案例，不写正文。",
+    "来源材料只能用 raw_materials 里已有的事实。rss / market / source_context 材料不要编造精确事实。",
+    "如果来源弱，就产出一条 source_type=composite_hint、confidence=low 的典型/复合案例。",
+    "不要抄 RSS 原文，只改写。",
+    "案例动作链要围绕开发者接入 GPT / Codex / Claude Code：项目背景、卡在哪一步（限流、超时、账单惊吓、官方故障、迁移）、试过什么、最终怎么选、还剩什么局限。",
+    "字段沿用现有 JSON 名，但语义已经不是币圈：",
+    "1. time_or_period：什么时候发生，例如高峰期、新模型放量周、出账单那天。",
+    "2. price_or_market_path：访问、限流、账单或官方故障怎么演变，不要写币价路径。",
+    "3. retail_entry_trigger：开发者为什么会踩这个坑，例如官方直连突然 429、账单跳涨、Claude Code 连不上。",
+    "4. risk_mechanism：为什么会恶化，例如官方限流、灰色渠道挂掉、中转仍依赖上游。",
+    "5. outcome_pressure：项目被卡住的代价，例如上线延期、调用中断、成本失控。",
+    "措辞要谨慎。不要承诺保证可用、不要暗示能绕过官方限制、不要写成已验证的真实朋友或精确账单截图。",
+    "叙述字段用简体中文。只输出 JSON。",
+    "输出格式：",
     "{",
     '  "should_use_case_research": true,',
     '  "research_summary": "",',
@@ -615,19 +524,19 @@ function buildFallbackResearch(questionTitle: string, shouldResearch: boolean): 
     case_materials: shouldResearch
       ? [
           {
-            case_label: "typical composite trading case",
+            case_label: "typical composite API access case",
             source_type: "composite_hint",
             source_label: "backend fallback",
             source_url: "",
-            time_or_period: "typical short-cycle market move",
+            time_or_period: "高峰期或新模型放量后的一两周",
             price_or_market_path:
-              "Use a self-consistent path such as a fast pump, a short consolidation, then a sharp retracement; do not present it as a verified token event.",
-            retail_entry_trigger: "retail trader enters after seeing a fast move, social proof, or fear of missing out",
-            risk_mechanism: "thin liquidity, late entry, leverage temptation, stop-loss failure, and emotional averaging down",
-            outcome_pressure: "small mistake becomes a large drawdown because exit liquidity disappears",
-            usable_angle: "Use this only as a common-pattern example when no reliable backend source material exists.",
+              "先官方直连能用，随后出现超时或连续 429，账单也比预期高；不要写成已验证的真实项目。",
+            retail_entry_trigger: "小团队或独立开发者卡在 GPT / Claude Code 访问不稳，或突然收到偏高账单",
+            risk_mechanism: "官方限流、网络环境、灰色渠道随时失效、中转服务仍依赖上游官方可用性",
+            outcome_pressure: "调用中断、上线延期，或成本突然抬高后只能临时降级模型",
+            usable_angle: "只有后端没有可靠来源时，才把这条当常见模式例子。",
             confidence: "low",
-            caution: "Do not claim this is a real verified case."
+            caution: "不要把这条写成已验证的真实案例。"
           }
         ]
       : [],
@@ -635,9 +544,9 @@ function buildFallbackResearch(questionTitle: string, shouldResearch: boolean): 
       ? "Use case material to carry the argument. Keep facts cautious and avoid repeating user-provided reference copy."
       : "",
     must_not_claim: [
-      "Do not claim insider knowledge.",
-      "Do not claim a source-backed case is independently verified unless the backend material proves it.",
-      "Do not present composite_hint as a real friend, real trade record, or screenshot-backed fact."
+      "不要声称有内部消息或官方合作。",
+      "不要把有来源的案例写成自己核实过的事实，除非后端材料明确证明。",
+      "不要把 composite_hint 写成真实朋友、真实账单截图或已验证项目。"
     ],
     collected_at: new Date().toISOString(),
     raw_material_count: 0,
@@ -738,24 +647,12 @@ function normalizeDate(value: string) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
-function extractCryptoSymbols(text: string) {
+function extractTopicSymbols(text: string) {
   const upper = text.toUpperCase();
-  const matches = upper.match(/\b[A-Z0-9]{2,12}\b/g) ?? [];
-  const blocked = new Set(["THE", "AND", "FOR", "WITH", "THIS", "THAT", "FROM", "WILL", "HAVE", "HAS", "ARE"]);
+  const matches = upper.match(/\b[A-Z0-9][A-Z0-9._-]{1,24}\b/g) ?? [];
+  const blocked = new Set(["THE", "AND", "FOR", "WITH", "THIS", "THAT", "FROM", "WILL", "HAVE", "HAS", "ARE", "HTTP", "HTTPS"]);
 
   return [...new Set(matches.filter((item) => !blocked.has(item)).slice(0, 8))];
-}
-
-function isUsdtSpotSymbol(symbol: string) {
-  if (!symbol.endsWith("USDT")) {
-    return false;
-  }
-
-  return !/(UP|DOWN|BULL|BEAR|[0-9][SL])USDT$/i.test(symbol);
-}
-
-function formatMetric(value: number | null) {
-  return typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown";
 }
 
 function sleep(ms: number) {

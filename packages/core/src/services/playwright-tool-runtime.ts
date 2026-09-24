@@ -1,11 +1,14 @@
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
+import { launchPersistentContext } from "cloakbrowser";
+import type { BrowserContext, Locator, Page } from "playwright-core";
 import type { ToolTraceAction, ToolTraceStage } from "@zhihu-mvp/shared";
 import { getAppConfig } from "../config/env.js";
 import { JobRepository } from "../repositories/job-repository.js";
 import { resolveBrowserProfileDir, getStealthLaunchOptions } from "../utils/browser.js";
+import { killBrowsersByUserDataDir, killProcessTree } from "../utils/chrome-manual-login.js";
 import { getStealthInitScripts, validateFingerprintConsistency } from "../utils/stealth-inject.js";
 
 /**
@@ -69,6 +72,7 @@ type RuntimeSession = {
   profileDir: string;
   lockPath: string;
   lockOwner: string;
+  pid: number | null;
 };
 
 export type RuntimeTraceContext = {
@@ -131,6 +135,7 @@ export type PageSnapshot = {
 
 export class PlaywrightToolRuntime {
   private readonly sessions = new Map<string, RuntimeSession>();
+  private readonly sessionCloseTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(private readonly jobRepository?: JobRepository) {}
 
@@ -138,7 +143,7 @@ export class PlaywrightToolRuntime {
     return this.runWithTrace(traceContext, "open", input, async (page) => {
       await page.goto(input.url, {
         waitUntil: "domcontentloaded",
-        timeout: 15_000
+        timeout: 60_000
       });
       return {
         url: page.url()
@@ -147,7 +152,7 @@ export class PlaywrightToolRuntime {
   }
 
   async snapshot(traceContext: RuntimeTraceContext) {
-    return this.runWithTrace(traceContext, "snapshot", {}, async (page) => this.readSnapshot(page));
+    return this.runWithTrace(traceContext, "snapshot", {}, async (page) => this.readSnapshot(page, traceContext.stage));
   }
 
   async click(traceContext: RuntimeTraceContext, input: ClickInput) {
@@ -165,8 +170,8 @@ export class PlaywrightToolRuntime {
       for (const selector of input.selectors) {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.scrollIntoViewIfNeeded();
-          const box = await locator.boundingBox();
+          await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => undefined);
+          const box = await locator.boundingBox({ timeout: 1500 }).catch(() => null);
           if (box && getAppConfig().antiDetectionV3Enabled) {
             await this.humanClick(page, selector);
             return {
@@ -174,7 +179,7 @@ export class PlaywrightToolRuntime {
               selector
             };
           }
-          await locator.click();
+          await locator.click({ timeout: 5000 }).catch(() => undefined);
           return {
             ok: true,
             selector
@@ -210,7 +215,7 @@ export class PlaywrightToolRuntime {
         }
 
         const clipboardResult = await page.evaluate(
-          async ({ text, html }) => {
+          async ({ text, html }: { text: string; html: string }) => {
             try {
               const ClipboardItemCtor = (window as any).ClipboardItem;
               const clipboard = navigator.clipboard as any;
@@ -258,7 +263,7 @@ export class PlaywrightToolRuntime {
         }
 
         const pasteEventResult = await page.evaluate(
-          ({ text, html }) => {
+          ({ text, html }: { text: string; html: string }) => {
             const selectors = [
               ".public-DraftEditor-content",
               ".DraftEditor-root div[contenteditable='true']",
@@ -394,10 +399,19 @@ export class PlaywrightToolRuntime {
         `${sanitizeFileSegment(input.label)}-${Date.now()}.png`
       );
 
-      await page.screenshot({
-        path: screenshotPath,
-        fullPage: true
-      });
+      try {
+        await page.screenshot({
+          path: screenshotPath,
+          fullPage: false,
+          timeout: 5_000,
+          animations: "disabled"
+        });
+      } catch {
+        await page.screenshot({
+          path: screenshotPath,
+          timeout: 5_000
+        }).catch(() => undefined);
+      }
 
       return {
         ok: true,
@@ -410,6 +424,38 @@ export class PlaywrightToolRuntime {
     await this.disposeSession(sessionKey, {
       closeContext: true
     });
+  }
+
+  scheduleSessionClose(sessionKey: string, delayMs: number) {
+    this.cancelScheduledClose(sessionKey);
+    const timer = setTimeout(() => {
+      this.sessionCloseTimers.delete(sessionKey);
+      console.warn("[browser] challenge/session keep-alive expired, force closing", { sessionKey, delayMs });
+      void this.closeSession(sessionKey).catch((error) => {
+        console.error("[browser] scheduled session close failed", {
+          sessionKey,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.sessionCloseTimers.set(sessionKey, timer);
+  }
+
+  cancelScheduledClose(sessionKey: string) {
+    const timer = this.sessionCloseTimers.get(sessionKey);
+    if (!timer) {
+      return;
+    }
+    clearTimeout(timer);
+    this.sessionCloseTimers.delete(sessionKey);
+  }
+
+  async closeAllSessions() {
+    for (const sessionKey of [...this.sessionCloseTimers.keys()]) {
+      this.cancelScheduledClose(sessionKey);
+    }
+    await Promise.all([...this.sessions.keys()].map((sessionKey) => this.closeSession(sessionKey)));
   }
 
   hasSession(sessionKey: string) {
@@ -446,13 +492,22 @@ export class PlaywrightToolRuntime {
 
     try {
       const stealthOptions = getStealthLaunchOptions(browserChannel, resolvedProfileDir);
+      const localProxyUrl = "http://127.0.0.1:7890";
+      const useLocalProxy = await canConnectLocalProxy("127.0.0.1", 7890);
+
+      const headless =
+        ["1", "true", "yes"].includes(String(process.env.PLAYWRIGHT_HEADLESS ?? "").trim().toLowerCase());
       const launchOptions: any = {
-        channel: browserChannel,
-        headless: false,
-        viewport: null,
-        ignoreDefaultArgs: ["--enable-automation"],
+        userDataDir: resolvedProfileDir,
+        headless,
+        viewport: headless ? { width: 1440, height: 900 } : null,
         args: stealthOptions.args,
       };
+
+      if (useLocalProxy) {
+        launchOptions.proxy = localProxyUrl;
+        launchOptions.geoip = true;
+      }
 
       // Add UA, locale if provided by stealth (for fingerprint consistency)
       if (stealthOptions.userAgent) {
@@ -465,7 +520,7 @@ export class PlaywrightToolRuntime {
         launchOptions.timezoneId = stealthOptions.timezoneId;
       }
 
-      const context = await chromium.launchPersistentContext(resolvedProfileDir, launchOptions);
+      const context = await launchPersistentContext(launchOptions);
 
       const page = context.pages()[0] ?? (await context.newPage());
 
@@ -481,7 +536,8 @@ export class PlaywrightToolRuntime {
         page,
         profileDir: resolvedProfileDir,
         lockPath,
-        lockOwner
+        lockOwner,
+        pid: readBrowserPid(context)
       };
 
       this.sessions.set(traceContext.sessionKey, session);
@@ -493,6 +549,7 @@ export class PlaywrightToolRuntime {
   }
 
   private async disposeSession(sessionKey: string, options?: { closeContext?: boolean }) {
+    this.cancelScheduledClose(sessionKey);
     const existing = this.sessions.get(sessionKey);
     if (!existing) {
       return;
@@ -502,9 +559,20 @@ export class PlaywrightToolRuntime {
 
     try {
       if (options?.closeContext !== false) {
+        try {
+          const pages = existing.context.pages();
+          await Promise.all(pages.map((p) => p.close({ runBeforeUnload: false }).catch(() => undefined)));
+        } catch {}
         await existing.context.close().catch(() => undefined);
       }
     } finally {
+      if (existing.pid && isProcessAlive(existing.pid)) {
+        await killProcessTree(existing.pid).catch(() => undefined);
+      }
+      const stillAlive = existing.pid ? isProcessAlive(existing.pid) : true;
+      if (stillAlive) {
+        await killBrowsersByUserDataDir(existing.profileDir).catch(() => undefined);
+      }
       await releaseProfileLock(existing.lockPath, existing.lockOwner).catch(() => undefined);
     }
   }
@@ -591,16 +659,18 @@ export class PlaywrightToolRuntime {
    */
   async humanClick(page: Page, selector: string, options?: { offset?: { x: number; y: number } }): Promise<void> {
     const locator = page.locator(selector).first();
-    await locator.scrollIntoViewIfNeeded();
+    await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => undefined);
 
-    const box = await locator.boundingBox();
+    const box = await locator.boundingBox({ timeout: 1500 }).catch(() => null);
     if (box) {
       const centerX = box.x + box.width / 2 + (options?.offset?.x ?? (Math.random() * 6 - 3));
       const centerY = box.y + box.height / 2 + (options?.offset?.y ?? (Math.random() * 6 - 3));
-      await this.humanMove(page, centerX, centerY);
+      await this.humanMove(page, centerX, centerY).catch(() => undefined);
     }
 
-    await locator.click();
+    await locator.click({ timeout: 8000 }).catch(async () => {
+      await locator.click({ force: true, timeout: 5000 });
+    });
 
     // Post-click micro-movement
     if (getAppConfig().antiDetectionV3Enabled) {
@@ -631,7 +701,7 @@ export class PlaywrightToolRuntime {
     const scrollCount = 2 + Math.floor(Math.random() * 3);
     for (let i = 0; i < scrollCount; i++) {
       const scrollY = 80 + Math.random() * 180;
-      await page.evaluate((y) => window.scrollBy(0, y), scrollY);
+      await page.evaluate((y: number) => window.scrollBy(0, y), scrollY);
       await humanWait(400 + scrollY * 3 + Math.random() * 300);
     }
 
@@ -795,48 +865,133 @@ export class PlaywrightToolRuntime {
     );
   }
 
-  private async readSnapshot(page: Page): Promise<PageSnapshot> {
-    const [editorButtons, buttons, submitButtons, visibleTexts, headings, links, questionLinks, editorContent, editorBoldTexts] =
-      await Promise.all([
-      collectTexts(
-        page,
-        [
-          ".AnswerForm button",
-          ".DraftEditor-root button",
-          "[class*='AnswerForm'] button",
-          "[class*='DraftEditor'] button"
-        ],
-        20
-      ),
-      collectTexts(page, ["button", "[role='button']"], 40),
-      collectMatchedTexts(
-        page,
-        [".AnswerForm button", "[class*='AnswerForm'] button", "button", "[role='button']"],
-        /发布回答|提交回答|更新回答|保存修改|发布修改/,
-        12,
-        200
-      ),
-      collectTexts(page, ["h1", "h2", "h3", "p", "button", "a", "[contenteditable='true']"], 90),
-      collectTexts(page, ["h1", "h2", "h3"], 12),
-      collectLinks(page, "a[href]", 30),
-        collectLinks(page, "a[href*='/question/']", 80),
-        collectEditorContent(page),
-        collectEditorBoldTexts(page)
-      ]);
+  private async readSnapshot(page: Page, stage?: RuntimeTraceContext["stage"]): Promise<PageSnapshot> {
+    const pending = this.collectPageSnapshot(page);
+    let timer: NodeJS.Timeout | null = null;
+    let finished = false;
+    const mayClosePage = stage !== "publishing" && stage !== "publish_verify" && stage !== "login_checking";
+    const budget = new Promise<PageSnapshot>((_, reject) => {
+      timer = setTimeout(() => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        if (mayClosePage) {
+          void page.close().catch(() => undefined);
+        }
+        reject(
+          new Error(mayClosePage ? "页面快照超过 12 秒，已关闭页面并跳过。" : "页面快照超过 12 秒，已跳过本次快照。")
+        );
+      }, SNAPSHOT_BUDGET_MS);
+    });
 
-    const dedupedTexts = dedupeStrings([...headings, ...visibleTexts]).slice(0, 90);
+    try {
+      const result = await Promise.race([pending, budget]);
+      finished = true;
+      return result;
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      void pending.catch(() => undefined);
+    }
+  }
+
+  private async collectPageSnapshot(page: Page): Promise<PageSnapshot> {
+    const dom = await readBoundedDomSnapshot(page);
+    let title = "";
+    try {
+      title = await Promise.race([
+        page.title(),
+        new Promise<string>((resolve) => setTimeout(() => resolve(""), 1_500))
+      ]);
+    } catch {
+      title = "";
+    }
 
     return {
       url: page.url(),
-      title: await page.title(),
-      visibleTexts: dedupedTexts,
-      buttons: dedupeStrings([...submitButtons, ...editorButtons, ...buttons]).slice(0, 48),
-      links,
-      questionLinks,
-      editorContent,
-      editorContentLength: editorContent?.length ?? 0,
-      editorBoldTexts
+      title,
+      visibleTexts: dom.visibleTexts,
+      buttons: dom.buttons,
+      links: dom.links,
+      questionLinks: dom.questionLinks,
+      editorContent: dom.editorContent,
+      editorContentLength: dom.editorContent?.length ?? 0,
+      editorBoldTexts: dom.editorBoldTexts
     };
+  }
+}
+
+async function readBoundedDomSnapshot(
+  page: Page
+): Promise<Omit<PageSnapshot, "url" | "title" | "editorContentLength">> {
+  const empty = {
+    visibleTexts: [] as string[],
+    buttons: [] as string[],
+    links: [] as Array<{ text: string; href: string }>,
+    questionLinks: [] as Array<{ text: string; href: string }>,
+    editorContent: null as string | null,
+    editorBoldTexts: [] as string[]
+  };
+  let timer: NodeJS.Timeout | null = null;
+  const pending = page
+    .evaluate(() => {
+      const clean = (value: string | null | undefined) => (value || "").replace(/\s+/g, " ").trim();
+      const takeText = (selector: string, limit: number) =>
+        Array.from(document.querySelectorAll(selector))
+          .slice(0, limit)
+          .map((element) => clean(element.textContent))
+          .filter(Boolean);
+      const buttons = Array.from(new Set([...takeText("button", 40), ...takeText("[role='button']", 20)])).slice(0, 48);
+      const visibleTexts = Array.from(
+        new Set([...takeText("h1, h2, h3", 12), ...takeText("p", 30), ...buttons])
+      ).slice(0, 90);
+      const toLinks = (selector: string, limit: number) =>
+        Array.from(document.querySelectorAll(selector))
+          .slice(0, limit)
+          .map((element) => ({
+            text: clean(element.textContent),
+            href: element.getAttribute("href") || ""
+          }))
+          .filter((item) => item.text && item.href);
+      const editor = document.querySelector(
+        ".public-DraftEditor-content, .DraftEditor-root div[contenteditable='true'], [role='textbox'], [contenteditable='true']"
+      );
+      const editorContent = editor ? clean(editor.textContent) : "";
+      const editorBoldTexts = editor
+        ? Array.from(
+            editor.querySelectorAll(
+              "strong, b, [style*='font-weight: bold'], [style*='font-weight:bold'], [style*='font-weight: 700'], [style*='font-weight:700']"
+            )
+          )
+            .map((element) => clean(element.textContent))
+            .filter(Boolean)
+            .slice(0, 50)
+        : [];
+      return {
+        buttons,
+        visibleTexts,
+        links: toLinks("a[href]", 30),
+        questionLinks: toLinks("a[href*='/question/']", 40),
+        editorContent: editor ? (editorContent || "") : null,
+        editorBoldTexts
+      };
+    })
+    .catch(() => null);
+
+  try {
+    const result = await Promise.race([
+      pending,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), 8_000);
+      })
+    ]);
+    return result ?? empty;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -854,8 +1009,62 @@ function mapRuntimeStageToJobStage(stage: RuntimeTraceContext["stage"]) {
 }
 
 async function tryClick(page: Page, input: ClickInput) {
+  const expandedNames = Array.from(
+    new Set(
+      (input.names ?? []).flatMap((n) => [
+        n,
+        n.replace(/[\u200b-\u200d\uFEFF]/g, "").trim()
+      ]).filter(Boolean)
+    )
+  );
+
+  const extraSelectors: string[] = [];
+  if (expandedNames.some((n) => n.includes("写回答"))) {
+    extraSelectors.push(
+      ".QuestionHeader-footer button.WriteAnswerButton",
+      ".QuestionHeader-footer button:has-text('写回答')",
+      ".QuestionHeaderActions button.WriteAnswerButton",
+      ".QuestionHeaderActions button:has-text('写回答')",
+      "button.WriteAnswerButton",
+      "button:has-text('写回答')"
+    );
+  }
+  if (expandedNames.some((n) => n.includes("编辑回答"))) {
+    extraSelectors.push(
+      ".QuestionHeader-footer button:has-text('编辑回答')",
+      ".QuestionHeader-footer button.WriteAnswerButton",
+      ".QuestionHeaderActions button:has-text('编辑回答')",
+      ".QuestionHeaderActions button.WriteAnswerButton",
+      "button:has-text('编辑回答')",
+      "button.WriteAnswerButton"
+    );
+  }
+  if (expandedNames.some((n) => n.includes("发布回答") || n.includes("提交回答") || n.includes("发布"))) {
+    extraSelectors.push(
+      "button:has-text('发布回答')",
+      "button:has-text('提交回答')",
+      "button:has-text('发布修改')",
+      "button:has-text('保存修改')",
+      ".PublishPanel button:has-text('发布')",
+      ".PublishPanel-btnGroup button:has-text('发布')"
+    );
+  }
+  const allSelectors = Array.from(new Set([...(input.selectors ?? []), ...extraSelectors]));
+
+  for (const selector of allSelectors) {
+    const locator = page.locator(selector);
+    const matched = await clickFirstUsableLocator(locator, `selector:${selector}`);
+    if (matched) {
+      return {
+        ok: true,
+        matchedBy: matched.matchedBy,
+        url: page.url()
+      };
+    }
+  }
+
   for (const role of input.roles ?? ["button", "link"]) {
-    for (const name of input.names ?? []) {
+    for (const name of expandedNames) {
       const locator = page.getByRole(role, {
         name,
         exact: input.exact ?? false
@@ -872,9 +1081,9 @@ async function tryClick(page: Page, input: ClickInput) {
     }
   }
 
-  for (const selector of input.selectors ?? []) {
-    const locator = page.locator(selector);
-    const matched = await clickFirstUsableLocator(locator, `selector:${selector}`);
+  for (const name of input.names ?? []) {
+    const locator = page.locator('button, [role="button"], a[href], [role="link"]').filter({ hasText: name });
+    const matched = await clickFirstUsableLocator(locator, `hasText:${name}`);
     if (matched) {
       return {
         ok: true,
@@ -884,7 +1093,22 @@ async function tryClick(page: Page, input: ClickInput) {
     }
   }
 
-  throw new Error("未找到点击目标。");
+  for (const name of input.names ?? []) {
+    const locator = page.getByText(name, { exact: false });
+    const matched = await clickFirstUsableLocator(locator, `text:${name}`);
+    if (matched) {
+      return {
+        ok: true,
+        matchedBy: matched.matchedBy,
+        url: page.url()
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    url: page.url()
+  };
 }
 
 async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
@@ -893,7 +1117,16 @@ async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
 
   for (let index = 0; index < count; index += 1) {
     const candidate = locator.nth(index);
-    if (!(await candidate.isVisible())) {
+    await candidate.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
+    if (!(await candidate.isVisible().catch(() => false))) {
+      continue;
+    }
+
+    // Skip inactive elements with pointer-events: none (e.g. sticky header buttons before scroll)
+    const isPointerEventsNone = await candidate
+      .evaluate((el) => window.getComputedStyle(el).pointerEvents === "none")
+      .catch(() => false);
+    if (isPointerEventsNone) {
       continue;
     }
 
@@ -907,6 +1140,10 @@ async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
         interceptedIndexes.push(index);
         continue;
       }
+      // If there are more candidates available, continue trying rather than aborting immediately
+      if (index + 1 < count) {
+        continue;
+      }
 
       throw error;
     }
@@ -914,22 +1151,26 @@ async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
 
   for (const index of interceptedIndexes) {
     const candidate = locator.nth(index);
-    const clickMode = await clickLocator(candidate, {
-      forceOnIntercept: true
-    });
-    return {
-      matchedBy: `${matchPrefix}:${index}:${clickMode}`
-    };
+    try {
+      const clickMode = await clickLocator(candidate, {
+        forceOnIntercept: true
+      });
+      return {
+        matchedBy: `${matchPrefix}:${index}:${clickMode}`
+      };
+    } catch {
+      continue;
+    }
   }
 
   return null;
 }
 
 async function clickLocator(locator: Locator, options?: { forceOnIntercept?: boolean }) {
-  await locator.scrollIntoViewIfNeeded();
+  await locator.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
 
   // Phase 2: Full humanMove with Bezier curve + gaussian jitter (AI-random control points for natural feel)
-  const box = await locator.boundingBox();
+  const box = await locator.boundingBox({ timeout: 1000 }).catch(() => null);
   if (box) {
     const centerX = box.x + box.width / 2;
     const centerY = box.y + box.height / 2;
@@ -944,17 +1185,43 @@ async function clickLocator(locator: Locator, options?: { forceOnIntercept?: boo
   }
 
   try {
-    await locator.click();
+    await locator.click({ timeout: 4000 });
     return "default";
   } catch (error) {
     if (!options?.forceOnIntercept || !isPointerInterceptedError(error)) {
-      throw error;
+      try {
+        await locator.click({ force: true, timeout: 3000 });
+        return "force";
+      } catch {
+        throw error;
+      }
     }
 
     await locator.click({
-      force: true
+      force: true,
+      timeout: 3000
     });
     return "force";
+  }
+}
+
+async function readAllTexts(locator: Locator) {
+  let timer: NodeJS.Timeout | null = null;
+  const pending = locator.allTextContents().catch(() => [] as string[]);
+  try {
+    const texts = await Promise.race([
+      pending,
+      new Promise<string[]>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("snapshot text timeout")), SNAPSHOT_READ_TIMEOUT_MS);
+      })
+    ]);
+    return texts.map((text) => text.replace(/\s+/g, " ").trim()).filter(Boolean);
+  } catch {
+    return [];
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -962,15 +1229,8 @@ async function collectTexts(page: Page, selectors: string[], limit: number) {
   const texts: string[] = [];
 
   for (const selector of selectors) {
-    const locator = page.locator(selector);
-    const count = await locator.count();
-    const indexes = buildSampleIndexes(count, limit);
-
-    for (const index of indexes) {
-      const text = (await locator.nth(index).textContent())?.replace(/\s+/g, " ").trim();
-      if (text) {
-        texts.push(text);
-      }
+    for (const text of await readAllTexts(page.locator(selector))) {
+      texts.push(text);
       if (texts.length >= limit) {
         return dedupeStrings(texts).slice(0, limit);
       }
@@ -984,13 +1244,9 @@ async function collectMatchedTexts(page: Page, selectors: string[], pattern: Reg
   const texts: string[] = [];
 
   for (const selector of selectors) {
-    const locator = page.locator(selector);
-    const count = await locator.count();
-    const indexes = buildSampleIndexes(count, sampleLimit);
-
-    for (const index of indexes) {
-      const text = (await locator.nth(index).textContent())?.replace(/\s+/g, " ").trim();
-      if (!text || !pattern.test(text)) {
+    const batch = (await readAllTexts(page.locator(selector))).slice(0, sampleLimit);
+    for (const text of batch) {
+      if (!pattern.test(text)) {
         continue;
       }
 
@@ -1004,50 +1260,35 @@ async function collectMatchedTexts(page: Page, selectors: string[], pattern: Reg
   return dedupeStrings(texts).slice(0, limit);
 }
 
-function buildSampleIndexes(count: number, limit: number) {
-  if (count <= 0 || limit <= 0) {
-    return [];
-  }
-
-  if (count <= limit) {
-    return Array.from({ length: count }, (_, index) => index);
-  }
-
-  const headCount = Math.ceil(limit * 0.6);
-  const tailCount = Math.max(0, limit - headCount);
-  const indexes: number[] = [];
-
-  for (let index = 0; index < Math.min(count, headCount); index += 1) {
-    indexes.push(index);
-  }
-
-  for (let index = Math.max(headCount, count - tailCount); index < count; index += 1) {
-    indexes.push(index);
-  }
-
-  return Array.from(new Set(indexes)).slice(0, limit);
-}
+const SNAPSHOT_READ_TIMEOUT_MS = 1_500;
+const SNAPSHOT_BUDGET_MS = 12_000;
 
 async function collectLinks(page: Page, selector: string, limit: number) {
-  const locator = page.locator(selector);
-  const count = Math.min(await locator.count(), limit);
-  const links: Array<{ text: string; href: string }> = [];
-
-  for (let index = 0; index < count; index += 1) {
-    const link = locator.nth(index);
-    const href = await link.getAttribute("href");
-    const text = (await link.textContent())?.replace(/\s+/g, " ").trim();
-    if (!href || !text) {
-      continue;
-    }
-
-    links.push({
-      text,
-      href
-    });
+  try {
+    return await page.locator(selector).evaluateAll(
+      (elements, max: number) => {
+        const links: Array<{ text: string; href: string }> = [];
+        for (const element of elements) {
+          if (!(element instanceof HTMLAnchorElement)) {
+            continue;
+          }
+          const href = element.getAttribute("href") || "";
+          const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+          if (!href || !text) {
+            continue;
+          }
+          links.push({ text, href });
+          if (links.length >= max) {
+            break;
+          }
+        }
+        return links;
+      },
+      limit
+    );
+  } catch {
+    return [];
   }
-
-  return links;
 }
 
 async function collectEditorContent(page: Page) {
@@ -1059,17 +1300,18 @@ async function collectEditorContent(page: Page) {
   ];
 
   for (const selector of selectors) {
-    const locator = page.locator(selector);
-    const count = await locator.count();
-
-    for (let index = 0; index < count; index += 1) {
-      const candidate = locator.nth(index);
-      if (!(await candidate.isVisible())) {
+    const candidate = page.locator(selector).first();
+    try {
+      if (!(await candidate.isVisible({ timeout: SNAPSHOT_READ_TIMEOUT_MS }))) {
         continue;
       }
 
-      const text = normalizeEditorText((await candidate.textContent()) ?? "");
-      return text;
+      const text = normalizeEditorText((await candidate.textContent({ timeout: SNAPSHOT_READ_TIMEOUT_MS })) ?? "");
+      if (text) {
+        return text;
+      }
+    } catch {
+      continue;
     }
   }
 
@@ -1085,16 +1327,13 @@ async function collectEditorBoldTexts(page: Page) {
   ];
 
   for (const selector of selectors) {
-    const locator = page.locator(selector);
-    const count = await locator.count();
-
-    for (let index = 0; index < count; index += 1) {
-      const candidate = locator.nth(index);
-      if (!(await candidate.isVisible())) {
+    const candidate = page.locator(selector).first();
+    try {
+      if (!(await candidate.isVisible({ timeout: SNAPSHOT_READ_TIMEOUT_MS }))) {
         continue;
       }
 
-      return candidate.evaluate((root) => {
+      return await candidate.evaluate((root: Element) => {
         const rootElement = root as HTMLElement;
         const boldTexts: string[] = [];
         const walker = document.createTreeWalker(rootElement, NodeFilter.SHOW_TEXT);
@@ -1139,6 +1378,8 @@ async function collectEditorBoldTexts(page: Page) {
 
         return boldTexts.slice(0, 50);
       });
+    } catch {
+      continue;
     }
   }
 
@@ -1250,6 +1491,31 @@ function isProcessAlive(pid: number) {
   } catch {
     return false;
   }
+}
+
+function readBrowserPid(context: BrowserContext): number | null {
+  try {
+    const browser = context.browser() as unknown as { process?: () => { pid?: number } | null };
+    const pid = browser?.process?.()?.pid;
+    return typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function canConnectLocalProxy(host: string, port: number) {
+  return new Promise<boolean>((resolve) => {
+    const socket = net.connect({ host, port });
+    const finish = (ok: boolean) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(400);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
 }
 
 function isAlreadyExistsError(error: unknown) {

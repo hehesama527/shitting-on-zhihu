@@ -1,7 +1,7 @@
 // 手动登录 Twitter 脚本
 // 用法：npx tsx manual-login.ts
 
-import { chromium } from 'playwright';
+import { launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 
 const ACCOUNT_HANDLE = 'account_a'; // 要登录的账户
@@ -19,14 +19,13 @@ async function loginToTwitter() {
 
   console.log(`📁 浏览器配置文件目录：${profileDir}\n`);
 
-  // 使用 launchPersistentContext 来使用现有的浏览器配置
-  const browser = await chromium.launchPersistentContext(profileDir, {
+  // Use CloakBrowser launchPersistentContext
+  const browser = await launchPersistentContext({
+    userDataDir: profileDir,
     headless: false,
-    channel: 'msedge',
     args: [
       '--no-first-run',
       '--no-default-browser-check',
-      '--disable-blink-features=AutomationControlled',
     ],
     viewport: { width: 1536, height: 864 },
     userAgent:

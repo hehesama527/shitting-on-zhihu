@@ -59,6 +59,13 @@ export type FeishuOpsIncidentNotificationInput = {
   questionTitle: string | null;
 };
 
+export type FeishuVideoTopicNotificationInput = {
+  batchId: string;
+  source: string;
+  count: number;
+  entryUrl: string | null;
+};
+
 export class FeishuNotificationService {
   async sendProblemNotification(input: FeishuProblemNotificationInput): Promise<FeishuNotificationResult> {
     const lines = [
@@ -122,6 +129,19 @@ export class FeishuNotificationService {
       `Suggested Action: ${formatValue(input.suggestedAction)}`,
       `Entry: ${formatValue(input.entryUrl)}`,
       `Detected At: ${this.formatTime(new Date())}`
+    ];
+
+    return this.sendTextMessage(lines.join("\n"));
+  }
+
+  async sendVideoTopicNotification(input: FeishuVideoTopicNotificationInput): Promise<FeishuNotificationResult> {
+    const lines = [
+      "[Video Hub] 选题已生成",
+      `Batch: ${input.batchId}`,
+      `Source: ${input.source}`,
+      `Count: ${input.count}`,
+      `Entry: ${formatValue(input.entryUrl)}`,
+      `Time: ${this.formatTime(new Date())}`
     ];
 
     return this.sendTextMessage(lines.join("\n"));

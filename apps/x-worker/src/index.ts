@@ -5,7 +5,6 @@ import {
   XNotificationService,
   XPublisherService,
   XPromptService,
-  XResearchService,
   XReviewAgentService,
   XWorkspaceRepository,
   XWorkerRunner,
@@ -16,7 +15,6 @@ import {
 const repository = new XWorkspaceRepository();
 const llmService = new XLlmService();
 const promptService = new XPromptService(llmService);
-const researchService = new XResearchService(llmService, repository);
 const writerService = new XWriterService(llmService);
 const reviewAgentService = new XReviewAgentService(llmService);
 const mainAgentService = new XMainAgentService(llmService);
@@ -26,7 +24,6 @@ const hotspotScoutService = new XHotspotScoutService(llmService);
 const runner = new XWorkerRunner(
   repository,
   llmService,
-  researchService,
   writerService,
   reviewAgentService,
   mainAgentService,

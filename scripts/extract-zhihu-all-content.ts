@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 import fs from 'fs/promises';
 import { readdirSync, existsSync } from 'fs';
@@ -45,9 +45,10 @@ async function main() {
       console.error('❌ 没有找到 Profile。');
       process.exit(1);
     }
-    const context = await chromium.launchPersistentContext(
-      path.join(browserDir, profiles[0].name), { headless: true, channel: 'msedge' }
-    );
+    const context = await launchPersistentContext({
+      userDataDir: path.join(browserDir, profiles[0].name),
+      headless: true,
+    });
     const allCookies = await context.cookies();
     await context.close();
     cookies = allCookies.filter(c =>

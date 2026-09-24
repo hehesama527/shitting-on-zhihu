@@ -99,7 +99,7 @@ foreach ($process in $processes) {
   await wait(1200);
 }
 
-async function killProcessTree(pid: number) {
+export async function killProcessTree(pid: number) {
   if (process.platform === "win32") {
     await new Promise<void>((resolve) => {
       const child = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
@@ -118,6 +118,52 @@ async function killProcessTree(pid: number) {
     process.kill(pid, "SIGTERM");
   } catch {
     return;
+  }
+
+  await wait(800);
+  if (!isPidAlive(pid)) {
+    return;
+  }
+
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    return;
+  }
+}
+
+export async function killBrowsersByUserDataDir(profileDir: string) {
+  if (!profileDir) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    await closeManualBrowserByProfileDir(profileDir);
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const child = spawn("pkill", ["-9", "-f", "--", profileDir], {
+      detached: false,
+      stdio: "ignore"
+    });
+    child.on("error", () => resolve());
+    child.on("close", () => resolve());
+  });
+}
+
+function isPidAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 

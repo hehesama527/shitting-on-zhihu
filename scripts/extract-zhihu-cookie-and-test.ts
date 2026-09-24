@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 import fs from 'fs/promises';
 import { readdirSync } from 'fs';
@@ -37,10 +37,10 @@ async function main() {
   try {
     console.log('🍪 正在从 Profile 提取 Cookie...');
     
-    // launchPersistentContext 直接返回 BrowserContext
-    const context = await chromium.launchPersistentContext(profilePath, {
+    // CloakBrowser launchPersistentContext
+    const context = await launchPersistentContext({
+      userDataDir: profilePath,
       headless: true,
-      channel: 'msedge',
     });
 
     const cookies = await context.cookies();

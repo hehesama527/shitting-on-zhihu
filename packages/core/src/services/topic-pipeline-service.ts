@@ -166,6 +166,19 @@ export class TopicPipelineService {
         continue;
       }
 
+      const claimedQuestion = await this.topicRepository.findClaimedQuestionByUrl(candidate.questionUrl, candidate.id);
+      if (claimedQuestion && claimedQuestion.status !== "new") {
+        await this.topicRepository.markCandidateDuplicate(candidate.id, claimedQuestion.duplicateReason);
+        logDebugTiming("topicPipeline.prepareNextPublishableDraft", "candidate_claimed_duplicate", {
+          publishJobId: input?.publishJobId ?? null,
+          candidateId: candidate.id,
+          ownerCandidateId: claimedQuestion.id,
+          ownerAccountId: claimedQuestion.accountId,
+          elapsedMs: getElapsedMs(candidateStartedAt)
+        });
+        continue;
+      }
+
       const sourceContext = safeParseJson<Record<string, unknown>>(candidate.sourceMetadataText ?? "{}", {});
       let topicCard = normalizeCachedTopicAgentOutput(sourceContext.prefilterTopicCard, candidate.questionTitle);
 
@@ -235,7 +248,19 @@ export class TopicPipelineService {
         sourceContext
       });
 
-      await this.topicRepository.markCandidateProcessing(candidate.id, JSON.stringify(topicCard.topic_fingerprint ?? {}));
+      const claim = await this.topicRepository.claimQuestionUrlForWriting(candidate.id, candidate.questionUrl);
+      if (!claim.claimed) {
+        logDebugTiming("topicPipeline.prepareNextPublishableDraft", "candidate_claim_failed", {
+          publishJobId: input?.publishJobId ?? null,
+          candidateId: candidate.id,
+          reason: claim.reason,
+          elapsedMs: getElapsedMs(candidateStartedAt)
+        });
+        continue;
+      }
+      if (topicCard.topic_fingerprint) {
+        await this.topicRepository.markCandidateProcessing(candidate.id, JSON.stringify(topicCard.topic_fingerprint));
+      }
 
       // Historical duplicate screening now uses only the normalized question URL.
       const topicCardId = await this.topicRepository.createTopicCard(
@@ -327,6 +352,7 @@ export class TopicPipelineService {
     promptVersionSnapshotJson: string | null;
     accountContext?: WriterAccountContext | null;
     accountSoulMarkdown?: string | null;
+    maxAttempts?: number;
     onStage?: (stage: JobStage) => Promise<void> | void;
   }) {
     const topicCardRecord = await this.topicRepository.getTopicCardById(input.topicCardId);
@@ -351,6 +377,7 @@ export class TopicPipelineService {
         revisionFeedback: input.revisionFeedback,
         accountContext: input.accountContext ?? null,
         accountSoulMarkdown: input.accountSoulMarkdown ?? null,
+        maxAttempts: input.maxAttempts,
         onStage: input.onStage
       },
       promptSnapshot
@@ -369,6 +396,7 @@ export class TopicPipelineService {
       accountContext?: WriterAccountContext | null;
       accountSoulMarkdown?: string | null;
       agentContextDocuments?: ZhihuAgentContextDocuments | null;
+      maxAttempts?: number;
       onStage?: (stage: JobStage) => Promise<void> | void;
     },
     promptSnapshot: PromptSnapshotMap
@@ -381,8 +409,9 @@ export class TopicPipelineService {
       questionUrl: input.questionUrl,
       topicCard: input.topicCard
     });
+    const maxAttempts = Math.max(1, Math.min(input.maxAttempts ?? MAX_DRAFT_REVIEW_ATTEMPTS, MAX_DRAFT_REVIEW_ATTEMPTS));
 
-    for (let attempt = 0; attempt < MAX_DRAFT_REVIEW_ATTEMPTS; attempt += 1) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const attemptStartedAt = Date.now();
       logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_start", {
         publishJobId: input.publishJobId,
@@ -445,10 +474,10 @@ export class TopicPipelineService {
           })
         );
         revisionFeedback = [
-          "Previous Writer output was empty or far too short.",
-          "Return a complete publishable Zhihu answer in JSON.content.",
-          "Follow the Topic Card writing_plan, backend case_research, soft-promo directive, and Account Soul.",
-          "Do not return a placeholder, request for input, or meta explanation."
+          "上一版写作结果是空的，或明显太短。",
+          "请在 JSON.content 里返回一篇完整、可发布的知乎回答。",
+          "遵守选题卡 writing_plan、后端 case_research、软广指令和账号 Soul。",
+          "不要返回占位文、向用户要输入，或解释自己在做什么。"
         ].join("\n");
         logDebugTiming("topicPipeline.generateReviewedDraft", "writer_too_short_retry", {
           publishJobId: input.publishJobId,
@@ -790,25 +819,16 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
+// 2026-09 产品定位从 CryptoPathX 切换为 dudu 中转站后，这里的正则也从
+// "币圈/交易术语" 换成 "大模型 API 接入/中转相关术语"，用来判断某个选题是否
+// 需要走"案例驱动"的写作默认值（更长篇幅、要求带具体案例）。
 const CASE_DRIVEN_TOPIC_PATTERNS = [
-  /\u5e01\u5708/u,
-  /\u7092\u5e01/u,
-  /\u5c71\u5be8\u5e01/u,
-  /\u52a0\u5bc6\u8d27\u5e01/u,
-  /\u4ea4\u6613/u,
-  /\u91cf\u5316/u,
-  /\u7b56\u7565/u,
-  /\u56de\u6d4b/u,
-  /\u5408\u7ea6/u,
-  /\u6760\u6746/u,
-  /\u4ed3\u4f4d/u,
-  /\u6b62\u635f/u,
-  /\u505a\u591a|\u505a\u7a7a/u,
-  /\u5fc3\u6001/u,
-  /\u5f2f\u8def/u,
-  /\u7a33\u5b9a\u76c8\u5229/u,
-  /\u76c8\u4e8f|\u56de\u64a4|\u6ed1\u70b9|\u7206\u4ed3/u,
-  /\b(?:BTC|ETH|Crypto|RSI|MACD|K\u7ebf|U)\b/iu
+  /gpt/iu,
+  /claude/iu,
+  /codex/iu,
+  /openrouter/iu,
+  /\u5927\u6a21\u578b|\u4e2d\u8f6c|\u4ee3\u7406|\u9650\u6d41|\u63a5\u5165|\u90e8\u7f72|\u8c03\u7528|\u8ba1\u8d39|\u8d26\u5355|\u5c01\u53f7|\u98ce\u63a7/u,
+  /\bAPI\b|\bSDK\b|\bToken\b/iu
 ];
 
 function shouldUseCaseDrivenDefaults(seedText: string) {
@@ -817,12 +837,12 @@ function shouldUseCaseDrivenDefaults(seedText: string) {
 
 function appendCaseWriterNote(existing: string) {
   const note =
-    "Case-driven default: for crypto/trading topics, make at least one concrete case carry the core argument. Prefer source/user-provided cases or backend case_research when available; otherwise use a realistic composite case with price/time path, entry trigger, position or budget, long/short temptation, stop-loss/action deformation, outcome pressure, and review takeaway. Do not keep reusing the same token, story arc, or reference wording across different answers.";
+    "案例驱动默认：开发者/API 接入/工具选题里，至少用一个具体案例承担核心论证。优先用来源材料、用户提供案例或后端 case_research；没有的话就写接近真实的复合案例，包含项目背景、具体卡点（限流、超时、账单惊吓、迁移需求、访问不稳）、试过什么、最终怎么选、还剩什么局限。不要在不同回答里反复用同一个项目故事、模型名或参考原文。";
 
   if (!existing) {
     return note;
   }
-  if (existing.includes("Case-driven default")) {
+  if (existing.includes("案例驱动默认") || existing.includes("Case-driven default")) {
     return existing;
   }
   return `${existing}\n${note}`;
@@ -1030,11 +1050,11 @@ function buildSoftPromoWriterInstruction(input: {
   productAnchor: string;
 }) {
   if (!input.shouldInclude) {
-    return "Topic Agent 判断该选题不适合强制加入软广。Writer 应优先把问题回答完整，不要为了推广硬带 CryptoPathX。";
+    return "Topic Agent 判断该选题不适合强制加入软广。Writer 应优先把问题回答完整，不要为了推广硬带 Dudu 中转站。";
   }
 
   const anchor = input.productAnchor ? `承接点：${input.productAnchor}。` : "";
-  return `Topic Agent 判断该选题适合自然加入软广，Writer 需要在不破坏回答价值的前提下自然提到 CryptoPathX。${anchor}原因：${input.reason}`;
+  return `Topic Agent 判断该选题适合自然加入软广，Writer 需要在不破坏回答价值的前提下自然提到 Dudu 中转站。${anchor}原因：${input.reason}`;
 }
 
 function resolveSoftPromoDirective(topicCard: Record<string, unknown>) {
@@ -1056,33 +1076,33 @@ function resolveSoftPromoDirective(topicCard: Record<string, unknown>) {
 
 function buildTopicAgentSingleSelectionPromptSuffix() {
   return [
-    "Case-driven planning rule: for crypto, trading, altcoin, contract, strategy, backtesting, risk-control, trading-psychology, capital-size, and stable-profit topics, set writing_plan.should_use_cases=true by default unless the question is only a narrow factual definition.",
-    "Case preservation rule: if sourceContext, backend case_research, user notes, title, or candidate context contains a concrete market case, price path, token path, or failure story, preserve it in recommended_angle or writing_plan.writer_notes for Writer.",
-    "Case quality rule: a usable case must include time/price path or market setup, why a retail trader enters, position or budget, long/short temptation, action deformation such as chasing/holding/stop-loss failure, result pressure, and review takeaway.",
-    "Case diversity rule: user-provided examples are style/quality references, not reusable copy. Do not keep reusing the same token, same price path, same story arc, or same wording across different answers.",
+    "案例规划：GPT / Claude Code 接入、API 中转/代理选型、成本控制、工具选型、AI 辅助编程工作流题，默认 writing_plan.should_use_cases=true，除非只是极窄定义题。",
+    "案例保留：如果 sourceContext、后端 case_research、用户备注、标题或候选上下文里有具体项目故事、接入失败或迁移踩坑，写进 recommended_angle 或 writing_plan.writer_notes，留给写作 Agent。",
+    "案例质量：可用案例必须包含项目背景（个人项目/小团队/创业）、用了哪些模型、具体卡点（限流、超时、账单惊吓、迁移需求、访问不稳）、试过什么、最终怎么选、还剩什么局限。",
+    "案例多样性：用户给的范文只是文风/质量参考，不是可复用原文。不要在不同回答里反复用同一个项目故事、同一个模型名或同一套措辞。",
     "Topic Agent 单题最终选题补充规则：",
-    "1. 必须认真使用 product.md、target.md 和 Account Soul，不要只按量化/回测关键词判断选题价值。",
-    "2. Topic Agent 需要自主判断题目是否适合当前账号，但内容重心必须更多放在币圈交易者身上：炒币、合约、杠杆、山寨币/主流币、行情结构、K 线形态、形态教学、AI 辅助交易判断、交易心态、风控、复盘和踩坑经验。",
+    "1. 必须认真使用 product.md、target.md 和 Account Soul，不要只按固定关键词判断选题价值。",
+    "2. Topic Agent 需要自主判断题目是否适合当前账号，但内容重心必须更多放在实际使用/想用 GPT、Claude Code 的开发者身上：官方接口访问不稳定、限流报错、账单/计费问题、接入方式选型、迁移评估、AI 辅助编程的实际使用体验。",
     "3. 在方向符合时，尽可能选择流量更高的问题：痛点更大众、讨论空间更大、搜索需求更稳定、标题更像真实用户会点的问题，应优先于很冷、很窄、很工程化的问题。",
-    "4. 形态识别/技术形态教学类题可以选，也可以加入软广。承接点是 Pattern Analysis、K 线/量价结构识别、误判边界和历史验证，不要写成指标百科。",
-    "5. AI 和交易联动类题可以选，也可以加入软广。承接点是 AI 解释指标、生成策略条件、解读回测结果、发现风险点；严禁暗示 AI 能预测行情、喊单或替用户交易。",
-    "6. 不要再把纯量化工作流作为选题方向。题目如果主要讨论量化策略上线、深度优化、参数调优、研究 pipeline 或团队研发效率，而不是币圈交易者的真实交易痛点，应设为 SKIP 或低优先级。",
-    "7. 泛交易心态题可以选，例如外汇交易者为什么亏损、如何避免成为韭菜这类题；但它们更适合作为纯经验分享，不要默认加入 CryptoPathX。",
-    "8. 对泛交易心态题，除非题目明确问工具、回测、监控、策略验证或复盘系统，否则 should_include_soft_promo=false，soft_promo_mode=none，topic_fingerprint.promo_entry=none。",
+    "4. 工具对比/选型类题可以选，也可以加入软广。承接点是官方直连 vs 中转/代理的取舍、怎么判断中转服务是否可信，不要写成产品测评合集。",
+    "5. AI 辅助编程类题可以选，也可以加入软广。承接点是怎么把 Claude Code / GPT 用得更顺手、更稳定、更省钱；严禁暗示某个中转服务能保证 100% 可用或能绕过官方限制。",
+    "6. 不要把纯理论科普题（大模型原理、Prompt 工程理论、行业新闻）作为主要选题方向，除非能自然承接到访问/成本/稳定性的具体痛点。",
+    "7. 泛开发者工具心态题可以选，例如怎么选编程助手、怎么看代码生成质量这类题；但它们更适合作为纯经验分享，不要默认加入 Dudu 中转站。",
+    "8. 对泛开发者工具心态题，除非题目明确问 API 访问、成本控制或中转/代理服务，否则 should_include_soft_promo=false，soft_promo_mode=none，topic_fingerprint.promo_entry=none。",
     "9. 软广需要有节奏，不要每一篇都带。整体按约 10 条里 7 条自然带产品、3 条纯分享/纯经验/纯观点来控制。",
-    "10. 即使题目能勉强接到产品，只要它更适合做人设信任、交易心态、踩坑经验、币圈常识或观点判断，就应优先留白：should_include_soft_promo=false。",
-    "11. 不要让纯量化题天然优先；如果币圈/心态/形态/风控/AI 交易联动题更符合账号 Soul 和读者痛点，可以给更高 priority 和 fit_score。",
+    "10. 即使题目能勉强接到产品，只要它更适合做人设信任、开发心得、踩坑经验或工具常识，就应优先留白：should_include_soft_promo=false。",
+    "11. 不要让纯理论题天然优先；如果访问/成本/稳定性/工具选型题更符合账号 Soul 和读者痛点，可以给更高 priority 和 fit_score。",
     "12. 选题结束后，必须单独判断这个选题是否适合自然加入软广。",
-    "13. 如果适合，把 should_include_soft_promo 设为 true，soft_promo_mode 设为 light 或 natural，并在 soft_promo_directive.writer_instruction 里明确告诉 Writer：这篇需要自然加入 CryptoPathX。",
-    "14. 如果不适合，把 should_include_soft_promo 设为 false，soft_promo_mode 设为 none，topic_fingerprint.promo_entry 写 none，并在 soft_promo_directive.writer_instruction 里明确告诉 Writer：这篇不强制加入软广，不要硬带 CryptoPathX。",
-    "15. 只有当 CryptoPathX 的真实能力能解决题目里的具体一步时，才允许 should_include_soft_promo=true；不要因为业务目标需要推广就默认每篇都带。",
+    "13. 如果适合，把 should_include_soft_promo 设为 true，soft_promo_mode 设为 light 或 natural，并在 soft_promo_directive.writer_instruction 里明确告诉 Writer：这篇需要自然加入 Dudu 中转站。",
+    "14. 如果不适合，把 should_include_soft_promo 设为 false，soft_promo_mode 设为 none，topic_fingerprint.promo_entry 写 none，并在 soft_promo_directive.writer_instruction 里明确告诉 Writer：这篇不强制加入软广，不要硬带 Dudu 中转站。",
+    "15. 只有当 Dudu 中转站的真实能力能解决题目里的具体一步时，才允许 should_include_soft_promo=true；不要因为业务目标需要推广就默认每篇都带。",
     "16. 必须输出 writing_plan，由 Topic Agent 决定正文长度、是否需要案例、是否需要算账、是否适合列表/短标题、哪些重点需要加粗。",
-    "17. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；交易经历、弯路复盘、新手入门、小本金、策略方法论、软文承接空间大的题用 long。",
+    "17. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；开发经历、弯路复盘、新手入门、成本优化、工具选型方法论、软文承接空间大的题用 long。",
     "18. 字数规则：target_words_min 是 Writer 必须达到的硬下限；target_words_max 只是软参考，可以超过，不能为了压字数牺牲案例、算账和信息密度。",
-    "19. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实朋友经历。",
-    "20. 数据规则：案例里的胜率、回撤、盈亏比、仓位、手续费、滑点等数字要贴近真实市场常识、保守且自洽，不要要求精确历史统计。",
-    "21. 算账规则：涉及本金、成本、收益预期、回撤、仓位、手续费、策略有效性时 should_include_calculation=true。",
-    "22. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、算账结论、操作原则、产品边界。",
+    "19. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实项目经历。",
+    "20. 数据规则：案例里的调用量、并发数、月账单、限流次数等数字要贴近真实开发场景常识、保守且自洽，不要要求精确历史统计。",
+    "21. 算账规则：涉及成本预算、调用量、方案选型的性价比时 should_include_calculation=true。",
+    "22. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、成本结论、操作原则、产品边界。",
     "23. suggested_sections 是结构提示，不是要求 Writer 原样使用的标题；避免反复输出“先说结论/最后补一句”这类固定模板。",
     "24. 只输出 JSON，不要 Markdown。",
     "单题输出格式必须包含以下字段：",
@@ -1091,7 +1111,7 @@ function buildTopicAgentSingleSelectionPromptSuffix() {
     '  "summary": "100-180字选题摘要",',
     '  "priority": "P0 | P1 | P2 | SKIP",',
     '  "fit_score": 0,',
-    '  "question_type": "工具推荐 | 方法验证 | 入门认知 | 行情判断 | 风险管理 | 策略构建 | 纯干货 | 其他",',
+    '  "question_type": "工具推荐 | 方法验证 | 入门认知 | 选型对比 | 成本优化 | 稳定性排查 | 纯干货 | 其他",',
     '  "persona_mode": "二牛实测型 | 二牛踩坑型 | 二牛对比型 | 二牛经验型",',
     '  "target_audience": ["目标读者1"],',
     '  "pain_points": ["痛点1"],',
@@ -1137,28 +1157,29 @@ function buildWriterSoftPromoPromptSuffix(topicCard: Record<string, unknown>) {
   const directive = resolveSoftPromoDirective(topicCard);
   if (directive.should_include) {
     return [
-      "Topic Agent soft-promo directive:",
-      "1. Topic Agent has decided this selected topic is suitable for natural soft promotion.",
-      "2. You must include CryptoPathX naturally in the answer, but the answer still needs to solve the Zhihu question first.",
-      "3. Use the product only where it fits the selected problem, method, verification path, review workflow, risk-control step, or tool-choice step.",
-      "4. Do not write a hard ad, feature dump, guarantee, exchange recommendation, or exaggerated product claim.",
-      "5. If the topic naturally involves tools, strategy verification, review workflow, risk control, or monitoring, prefer a workflow-style soft mention: briefly mention 1-2 well-known non-exchange research/charting/backtesting tools where they truly fit, then explain why CryptoPathX is more suitable for the verification/backtesting/review step.",
-      "6. Do not bash peer tools, invent comparisons, or recommend exchanges/trading platforms. Use peer tools only as realistic context.",
-      `7. Topic Agent reason: ${directive.reason || "not provided"}`,
-      directive.product_anchor ? `8. Product anchor: ${directive.product_anchor}` : null,
-      `9. Writer instruction: ${directive.writer_instruction}`
+      "选题 Agent 软广指令：",
+      "1. 选题 Agent 判断这道已选题适合自然软广。",
+      "2. 正文必须自然出现 Dudu 中转站，但仍然要先把知乎问题回答完整。",
+      "3. 只在适合的位置用产品：官方访问不稳、成本控制、迁移，或中转/代理选型。",
+      "4. 不要写成硬广、功能清单、保证话术或夸大宣称。",
+      "5. 如果题目天然涉及 API 访问、成本或工具选型，优先用工作流式软提：真正合适时简短提 1-2 个广为人知的同类方案（如 OpenRouter，或自建中转 New API / LiteLLM），再说清楚为什么 Dudu 中转站更适合这一步访问/成本问题。",
+      "6. 不要贬低同类工具，不要编造对比，不要声称能绕过官方限制。同类工具只当真实工作流对照。",
+      "7. 正文、标题、摘要都不要出现 api.dududu.cloud、dududu.cloud。https 链接不要写进中间段落。产品段必须有且仅有 1 句 **加粗** 引导，点名文末 GitHub 仓库 「router-list」，并写清打开后看费率、手动教程或 CC Switch 中与本题最相关的一项。文末单独加「参考文献」，链接上方加粗说明，只放一次 https://github.com/hehesama527/router-list 。",
+      `8. 选题原因：${directive.reason || "未提供"}`,
+      directive.product_anchor ? `9. 产品承接点：${directive.product_anchor}` : null,
+      `10. 给写作 Agent 的指令：${directive.writer_instruction}`
     ]
       .filter(Boolean)
       .join("\n");
   }
 
   return [
-    "Topic Agent soft-promo directive:",
-    "1. Topic Agent has decided this selected topic is not suitable for forced soft promotion.",
-    "2. Do not add CryptoPathX merely to satisfy the general promotion goal.",
-    "3. Answer the Zhihu question normally. If the answer can be stronger without a product mention, leave the product out.",
-    `4. Topic Agent reason: ${directive.reason || "not provided"}`,
-    `5. Writer instruction: ${directive.writer_instruction}`
+    "选题 Agent 软广指令：",
+    "1. 选题 Agent 判断这道已选题不适合强制软广。",
+    "2. 不要只为了完成推广目标而硬加 Dudu 中转站。",
+    "3. 正常回答知乎问题。如果不提产品答案更强，就不要提。也不要加 GitHub 参考文献。",
+    `4. 选题原因：${directive.reason || "未提供"}`,
+    `5. 给写作 Agent 的指令：${directive.writer_instruction}`
   ].join("\n");
 }
 
@@ -1166,9 +1187,9 @@ function buildWriterCaseResearchPromptSuffix(topicCard: Record<string, unknown>)
   const research = readRecord(topicCard.case_research);
   if (!research) {
     return [
-      "Backend case research:",
-      "No backend case_research payload was attached for this topic.",
-      "If cases are required by the writing plan, use a realistic typical/composite case with self-consistent numbers, and do not present it as a verified real event or personal record."
+      "后端案例研究：",
+      "这道题没有附带后端 case_research 材料。",
+      "如果写作计划要求案例，请写接近真实、数字自洽的典型/复合案例，不要写成已验证的真实事件或个人记录。"
     ].join("\n");
   }
 
@@ -1180,7 +1201,7 @@ function buildWriterCaseResearchPromptSuffix(topicCard: Record<string, unknown>)
     : [];
 
   return [
-    "Backend case research:",
+    "后端案例研究：",
     JSON.stringify(
       {
         should_use_case_research: research.should_use_case_research === true,
@@ -1205,23 +1226,23 @@ function buildWriterCaseResearchPromptSuffix(topicCard: Record<string, unknown>)
       null,
       2
     ),
-    "Writer rules for backend case_research:",
-    "1. Prefer these materials when the writing plan asks for cases, but do not mechanically paste them.",
-    "2. High/medium confidence rss, market, and source_context materials may be used as cautious evidence. Low-confidence or composite_hint materials must be written as common-pattern examples, not verified facts.",
-    "3. Do not copy source wording. Rebuild the case in a first-person analysis voice with a complete action chain.",
-    "4. Do not reuse a user-provided reference case as the default case for every topic.",
-    "5. If the attached materials are weak or off-topic, say less about the exact event and use a self-consistent composite case."
+    "后端 case_research 写作规则：",
+    "1. 写作计划要求案例时优先用这些材料，但不要机械粘贴。",
+    "2. 高/中置信度的 rss、market、source_context 材料可以当谨慎证据。低置信度或 composite_hint 材料必须写成常见模式例子，不能写成已验证事实。",
+    "3. 不要抄来源原文。用第一人称分析口吻，按完整动作链重写案例。",
+    "4. 不要把用户给的参考案例当成每道题的默认案例。",
+    "5. 如果附带材料弱或跑题，少写具体事件，改用数字自洽的复合案例。"
   ].join("\n");
 }
 
 function buildWriterWritingPlanPromptSuffix(topicCard: Record<string, unknown>) {
   const plan = normalizeWritingPlan(topicCard.writing_plan, buildFallbackWritingPlan());
   const lines = [
-    "Topic Agent writing plan:",
-    "1. Topic Agent decides the article length, structure, case usage, calculation usage, and list usage for this specific topic.",
-    "2. Follow this plan unless it directly conflicts with hard safety boundaries, Account Soul, or the soft-promo directive.",
+    "选题 Agent 写作计划：",
+    "1. 这道题的篇幅、结构、是否用案例、是否算账、是否用列表，由选题 Agent 决定。",
+    "2. 除非和硬安全边界、账号 Soul 或软广指令直接冲突，否则按这个计划写。",
     `3. length_mode: ${plan.length_mode}`,
-    `4. target length: at least ${plan.target_words_min} Chinese characters; ${plan.target_words_max} is a soft reference, not a hard cap.`,
+    `4. 目标字数：至少 ${plan.target_words_min} 个汉字；${plan.target_words_max} 只是软参考，不是硬上限。`,
     `5. structure_mode: ${plan.structure_mode}`,
     `6. should_use_cases: ${plan.should_use_cases}`,
     `7. case_style: ${plan.case_style}`,
@@ -1231,16 +1252,16 @@ function buildWriterWritingPlanPromptSuffix(topicCard: Record<string, unknown>) 
     `11. bold_targets: ${plan.bold_targets.join(" / ")}`,
     `12. suggested_sections: ${plan.suggested_sections.join(" / ")}`,
     `13. writer_notes: ${plan.writer_notes}`,
-    "14. target_words_min is mandatory. It is acceptable to exceed target_words_max when the answer needs more cases, calculation, or concrete detail.",
-    "15. If should_use_bold=true, include 2-4 bold spans with **...** around key conclusions, risk boundaries, calculation takeaways, or operating principles. Do not bold full paragraphs.",
-    "16. If cases are requested but no verified real case is provided, write realistic typical/composite cases with plausible data ranges; do not present them as verified real friends or real personal records.",
-    "17. For crypto/trading topics, the case should carry the argument rather than decorate it. Include a concrete action chain: price/time path or market setup, entry trigger, position/budget, long/short temptation, stop-loss or take-profit action, result pressure, and review takeaway.",
-    "18. If the input/topic context contains a concrete market case, use it as one possible evidence source with cautious wording such as 'based on this path' or 'a similar pattern', unless it conflicts with safety or facts. Do not claim independent verification.",
-    "19. Do not copy user-provided reference wording, and do not turn one reference case into the repeated default example for every topic.",
-    "20. Prefer different cases for different answers. Use backend case_research, source context, or a new realistic composite case that fits the specific question.",
-    "21. If no concrete case is provided, create a realistic typical/composite case with self-consistent numbers and clearly common-pattern phrasing.",
-    "22. Use suggested_sections as planning cues, not literal repeated headings. Vary openings and endings across similar topics.",
-    "23. Add substance through scenarios, calculations, counterexamples, steps, and stage suggestions; do not repeat the same claim just to increase length."
+    "14. target_words_min 是硬下限。需要更多案例、算账或具体细节时，可以超过 target_words_max。",
+    "15. 如果 should_use_bold=true，用 **...** 加粗 2 到 4 处关键结论、风险边界、算账结论或操作原则。不要整段加粗。",
+    "16. 需要案例但没有已验证真实案例时，写接近真实、数据合理的典型/复合案例；不要写成已验证的真实朋友或真实个人记录。",
+    "17. 开发/API 接入/工具选题里，案例要承担论证，不要当装饰。动作链包含：项目背景、具体卡点（限流、超时、账单、迁移需求）、试过什么、最终怎么选、还剩什么局限。",
+    "18. 如果输入/题目上下文里有具体来源案例，可以用谨慎说法作为证据，例如“按这条路径看”“类似情况里”；不要声称自己核实过，也不要和安全或事实冲突。",
+    "19. 不要抄用户给的参考原文，也不要把一个参考案例当成每道题的默认例子。",
+    "20. 不同回答优先用不同案例。用后端 case_research、来源上下文，或贴合这道题的新复合案例。",
+    "21. 如果没有具体案例，就写接近真实、数字自洽、明确是常见模式的典型/复合案例。",
+    "22. suggested_sections 只是结构提示，不是必须原样使用的标题。同类题要变化开头和结尾。",
+    "23. 用场景、算账、反例、步骤和阶段建议增加实质内容，不要为了凑字数重复同一个观点。"
   ];
 
   return lines.join("\n");

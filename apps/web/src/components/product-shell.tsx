@@ -10,7 +10,7 @@ type ProductNavItem = {
 };
 
 type ProductShellProps = {
-  tone: "zhihu" | "twitter" | "images" | "models" | "hotspots";
+  tone: "zhihu" | "twitter" | "images" | "models" | "hotspots" | "video";
   kicker: string;
   title: string;
   description: string;

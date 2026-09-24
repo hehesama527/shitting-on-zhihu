@@ -106,9 +106,13 @@ export class ReviewService {
     await hooks?.onStage?.("review_editorial");
     await hooks?.onStage?.("review_publish");
 
-    const hardGate = normalizeHardGate(combined.hardGate);
     const editorial = normalizeEditorial(combined.editorial);
     const publish = normalizePublish(combined.publish, input.content);
+    const hardGate = applyForbiddenRelayDomainHardGate(
+      normalizeHardGate(combined.hardGate),
+      input.content,
+      publish.approved_content
+    );
     const quality = normalizeContentQuality(editorial.quality, editorial, publish);
 
     if (hardGate.decision === "BLOCK") {
@@ -169,40 +173,40 @@ function buildCombinedReviewPrompt(
   )}
 
 Additional instructions:
-You are running a combined pre-publish review and must return exactly three sections:
+你正在做发布前的合并审核，必须正好返回三个部分：
 1. hardGate
 2. editorial
 3. publish
 
-Required output contract:
-1. hardGate.decision must be PASS or BLOCK.
-2. editorial.decision must be PASS or REVISE.
-3. publish.decision must be PASS, REVISE, or BLOCK_DUPLICATION.
-4. Only when publish.decision = PASS may publish.approved_content contain the final publishable article.
-5. If a section has no issues, return an empty issues array.
-6. Do not return a fourth top-level final decision. Return only the three section objects.
-7. Return JSON only. No markdown. No explanation outside JSON.
-8. editorial.quality must score whether the answer feels native to Zhihu, account-specific, concrete, evidenced, restrained, and low-AI-smell.
+输出约定：
+1. hardGate.decision 只能是 PASS 或 BLOCK。
+2. editorial.decision 只能是 PASS 或 REVISE。
+3. publish.decision 只能是 PASS、REVISE 或 BLOCK_DUPLICATION。
+4. 只有 publish.decision = PASS 时，publish.approved_content 才能放最终可发布正文。
+5. 某一层没有问题时，issues 返回空数组。
+6. 不要再返回第四个顶层最终决策。只返回这三个对象。
+7. 只输出 JSON。不要 Markdown。JSON 外不要解释。
+8. editorial.quality 要打分：这篇像不像知乎原生回答、像不像这个账号、够不够具体、有没有证据、够不够克制、AI 味低不低。
 
 ${buildAiAuthenticityReviewPromptSuffix()}
 
-Duplication review must be intentionally relaxed.
-The goal is not to force every article to sound like it was written by a completely different person.
-The real goal is only to prevent the new article from feeling like a copy-paste rewrite of a recent article.
+重复审核要故意放宽。
+目标不是逼每篇文章听起来像换了一个人写的。
+真正要拦的，只是新文章读起来像最近某篇的换皮重写。
 
-When checking duplication against the last 10 published articles:
-1. Shared persona, shared product, shared audience, shared product features, and shared brand voice are normal. Do not treat them as duplication by themselves.
-2. Similar product mentions, similar soft-promo logic, similar risk reminders, or one repeated metaphor are not enough for BLOCK_DUPLICATION.
-3. If the article still gives fresh value, a new framing, a different problem entry, a meaningfully different argument path, or a different practical takeaway, prefer PASS.
-4. If the article is useful but some paragraphs feel too close to past content, prefer REVISE instead of BLOCK_DUPLICATION.
-5. Only use BLOCK_DUPLICATION when the overall reading experience strongly feels like the same article rewritten:
-   same opening angle,
-   same core argument path,
-   same case structure,
-   same practical advice sequence,
-   and same closing push,
-   such that a normal reader would likely feel it is basically a recycled answer.
-6. Do not block duplication merely because both articles promote the same product in a similar way.
+对照最近 10 篇已发布内容查重复时：
+1. 共用同一个人设、同一个产品、同一类读者、同一套产品能力和同一套品牌语气，都是正常的。单凭这些不要判重复。
+2. 类似的产品提及、类似的软广逻辑、类似的风险提醒，或重复一个比喻，都不够构成 BLOCK_DUPLICATION。
+3. 如果文章仍有新价值、新框架、不同问题入口、明显不同的论证路径，或不同的可操作结论，优先 PASS。
+4. 如果文章有用，但部分段落和旧文太近，优先 REVISE，不要直接 BLOCK_DUPLICATION。
+5. 只有整体阅读体验强烈像同一篇文章重写时，才用 BLOCK_DUPLICATION：
+   同一套开头角度、
+   同一套核心论证路径、
+   同一套案例结构、
+   同一套操作建议顺序、
+   同一套收口推销，
+   普通读者会觉得这基本上是一篇回收回答。
+6. 不要只因为两篇都用类似方式推广同一个产品，就判重复。
 
 Output schema:
 {
@@ -257,49 +261,49 @@ function buildAiAuthenticityReviewPromptSuffix() {
 const USE_COMBINED_REVIEW_AI_AUTHENTICITY_PROMPT_ROLLBACK = false;
 const COMBINED_REVIEW_AI_AUTHENTICITY_PROMPT_ROLLBACK = "";
 
-const COMBINED_REVIEW_AI_AUTHENTICITY_PROMPT_V1 = `AI-authenticity review:
-This is a prompt-only review signal inside Review Agent. It is not a separate approval gate.
-Judge whether the draft reads like AI-generated content or AI-humanized content. Do not claim authorship certainty; judge only reader-facing risk.
+const COMBINED_REVIEW_AI_AUTHENTICITY_PROMPT_V1 = `AI 痕迹审核：
+这是审核 Agent 内部的提示信号，不是单独的通过门槛。
+判断这篇草稿读起来更像 AI 生成，还是像 AI 拟人化处理后的文字。不要断言作者身份，只判断读者会不会觉得假。
 
-Check these signals:
-1. Over-complete, over-smooth argument structure.
-2. Template openings, universal conclusions, or standard three-part progression.
-3. Personal-experience wording without concrete scene support, such as vague "I used to..." or "from my experience..." claims.
-4. Dense numbers, cases, or judgments with unclear source boundaries.
-5. Cases that feel too perfectly constructed instead of naturally observed or clearly marked as composite.
-6. Product insertion that is too smooth, too planned, or reads like a soft-ad bridge rather than a workflow step.
-7. Paragraph rhythm that is too stable, where every paragraph follows claim + explanation + summary.
-8. Deliberately strong opinions, deliberately colloquial lines, or "veteran trader" voice that feels staged.
-9. Polished golden-line endings, slogan-like elevation, or over-neat closure.
-10. Generic AI filler such as "therefore / meanwhile / overall", vague authority attribution, excessive abstract nouns, and unnecessary three-item lists.
-11. Repeatedly using the same voice pattern across long answers, especially when every paragraph stays equally polished and equally complete.
-12. Using a pseudo-experienced tone without one or two grounded, imperfect details that a real person would usually leave in.
+检查这些信号：
+1. 论证过于完整、过于顺滑。
+2. 模板化开头、万能结尾，或标准三段论推进。
+3. 有亲身经历口吻，却没有具体场景支撑，例如空泛的“以前我也……”“以我的经验……”。
+4. 数字、案例、判断堆得很密，但来源边界不清楚。
+5. 案例过于工整，不像自然观察到的，也没有标明是复合案例。
+6. 产品插入过于顺、过于计划，读起来像软广桥段，而不像工作流里的一步。
+7. 段落节奏过于稳定，每段都是观点 + 解释 + 总结。
+8. 刻意很冲的观点、刻意口语，或“资深接入顾问”腔显得像在演戏。
+9. 结尾金句打磨过度、口号式升华，或收得过于整齐。
+10. 通用 AI 填料：因此/同时/总体来看、模糊权威归因、抽象名词过多、没必要的三要点列表。
+11. 长文里反复用同一套语气，尤其是每一段都同样光滑、同样完整。
+12. 假装很有经验，却没有留下一两处真人通常会留下的、不完美的具体细节。
 
-Scoring rubric for editorial.quality.dimensions.ai_smell.score:
-85-100: Almost no obvious AI-writing risk.
-70-84: Light AI smell; publishable if other review dimensions pass.
-55-69: Moderate AI smell; give local rewrite suggestions and make the suspicious passages explicit.
-40-54: Obvious AI smell; request REVISE and identify the sections that should be rewritten.
-0-39: Highly templated or synthetic; do not publish without major rewrite.
+editorial.quality.dimensions.ai_smell.score 打分：
+85-100：几乎看不出明显 AI 写作风险。
+70-84：有一点 AI 味；其他维度过关就可以发。
+55-69：中等 AI 味；给出局部改写建议，并明确标出可疑段落。
+40-54：AI 味明显；要求 REVISE，并指出该改哪些段。
+0-39：高度模板化或合成感；不大幅改写不能发。
 
-Sensitivity rule:
-1. If the draft shows 3 or more concrete AI-smell signals from the list above, do not keep ai_smell above 69.
-2. If the draft shows 5 or more signals, or one very strong staged-persona signal, score ai_smell below 55 unless there is very strong grounded detail that clearly outweighs the pattern.
-3. A polished long answer is not automatically AI-written, but if the polish stays uniform across most paragraphs and there are no rough edges, do not be conservative with the score.
+敏感度规则：
+1. 上面清单里出现 3 个及以上具体信号时，ai_smell 不要高于 69。
+2. 出现 5 个及以上信号，或有一个很强的扮演人设信号时，ai_smell 打到 55 以下；除非有非常扎实的具体细节明显压过这个模式。
+3. 写得漂亮的长文不等于 AI 写的；但如果大部分段落都一样光滑，又没有任何毛边，打分不要过于保守。
 
-Output requirements for AI-smell feedback:
-1. Put concrete findings in editorial.quality.dimensions.ai_smell.issues.
-2. Put executable rewrite direction in editorial.quality.dimensions.ai_smell.suggestion.
-3. If AI smell contributes to revision, include the same concrete evidence in editorial.rewrite_brief and editorial.quality.rewriteBrief so Writer can revise through the existing Review -> Writer loop.
-4. Quote or summarize the suspicious original phrase or paragraph. Do not write vague feedback such as "make it more natural".
-5. If evidence is weak, keep ai_smell.score >= 70 and do not force REVISE only for AI smell.
-6. Only score below 55 when there are multiple concrete signals or one severe signal that would make a normal Zhihu reader feel the answer is synthetic.
-7. If the article is structurally strong but still feels over-polished, point to the exact paragraphs that read most staged instead of giving a generic global comment.
+AI 味反馈要求：
+1. 具体发现放进 editorial.quality.dimensions.ai_smell.issues。
+2. 可执行的改写方向放进 editorial.quality.dimensions.ai_smell.suggestion。
+3. 如果 AI 味构成修改理由，把同样的具体证据写进 editorial.rewrite_brief 和 editorial.quality.rewriteBrief，方便写作 Agent 按现有审核-改写循环修改。
+4. 引用或概括可疑原句/原段。不要写“再自然一点”这种空反馈。
+5. 证据弱时，保持 ai_smell.score >= 70，不要只因为 AI 味就强制 REVISE。
+6. 只有多个具体信号，或一个会让普通知乎读者觉得这篇是合成文的严重信号时，才打到 55 以下。
+7. 如果结构扎实但仍过光滑，点出最像在演戏的那几段，不要给空泛的全局评价。
 
-Example feedback style:
-1. "以前我也这样，后来学着做回测" uses personal-experience voice but has no specific scene or action detail, so it feels like humanized-template writing. Ask Writer to either add a concrete operation detail or change it to a general reader observation.
-2. "CryptoPathX" appears in consecutive paragraphs and the transition is too smooth, making the product mention feel pre-planned. Ask Writer to keep one product mention and turn the other into "visual backtesting tool" or a concrete workflow step.
-3. The closing sentence is too polished and slogan-like. Ask Writer to end with a restrained action boundary or a specific risk reminder.`;
+反馈示例：
+1. “以前我也这样，后来学着先看账单”有亲身经历口吻，但没有具体场景或动作细节，像拟人化模板。请写作 Agent 补一个具体操作细节，或改成对读者的一般观察。
+2. “Dudu 中转站”连续两段出现，过渡过于顺滑，产品提及像提前安排好的。请写作 Agent 只保留一次产品提及，另一次改成“中转方案”或具体工作流步骤。
+3. 结尾句过于打磨、像口号。请写作 Agent 改成克制的动作边界，或一个具体风险提醒。`;
 
 type SoftPromoReviewDirective = {
   shouldInclude: boolean;
@@ -345,27 +349,29 @@ function buildReviewSoftPromoPromptSuffix(directive?: SoftPromoReviewDirective) 
   const resolved = directive ?? resolveSoftPromoDirective(null);
   if (resolved.shouldInclude) {
     return [
-      "Soft-promo review rule:",
-      "1. Topic Agent is the source of truth for whether this selected topic requires a soft promotion.",
-      "2. Topic Agent marked include_soft_promo=true, so check whether the draft naturally includes CryptoPathX in a concrete, non-exaggerated way.",
-      "3. If CryptoPathX is completely absent, editorial.decision should usually be REVISE with a concise rewrite_brief asking Writer to add it naturally at the selected product anchor.",
-      "4. If CryptoPathX appears but reads like a hard ad, feature dump, guarantee, exchange recommendation, or unrelated insertion, ask for revision.",
-      `5. Topic Agent reason: ${resolved.reason || "not provided"}`,
-      resolved.productAnchor ? `6. Product anchor: ${resolved.productAnchor}` : null,
-      resolved.writerInstruction ? `7. Writer instruction: ${resolved.writerInstruction}` : null
+      "软广审核规则：",
+      "1. 这道已选题要不要软广，以选题 Agent 为准。",
+      "2. 选题 Agent 标记 include_soft_promo=true，所以要检查草稿有没有把 Dudu 中转站自然放进具体、不夸大的位置。",
+      "3. 如果完全没有 Dudu 中转站或短称 Dudu，editorial.decision 通常应为 REVISE，并在 rewrite_brief 里简洁要求写作 Agent 在选定的产品承接点自然补上。",
+      "4. 如果出现了产品名，但读起来像硬广、功能清单、保证话术或无关插入，要求修改。",
+      "5. 正文出现 api.dududu.cloud 或 dududu.cloud 时，hardGate 必须 BLOCK。提到 Dudu 时，必须有一句 **加粗** 引导点名文末 GitHub 仓库 「router-list」 并写清打开后看什么；文末「参考文献」只放 https://github.com/hehesama527/router-list ，链接上方要有加粗说明。缺少引导或引导未加粗时要求 REVISE。这段参考文献不算结尾硬广。",
+      `6. 选题原因：${resolved.reason || "未提供"}`,
+      resolved.productAnchor ? `7. 产品承接点：${resolved.productAnchor}` : null,
+      resolved.writerInstruction ? `8. 给写作 Agent 的指令：${resolved.writerInstruction}` : null
     ]
       .filter(Boolean)
       .join("\n");
   }
 
   return [
-    "Soft-promo review rule:",
-    "1. Topic Agent is the source of truth for whether this selected topic requires a soft promotion.",
-    "2. Topic Agent marked include_soft_promo=false, so do not request revision merely because CryptoPathX is absent.",
-    "3. For this topic, absence of product mention is acceptable when the answer is otherwise useful and on-topic.",
-    "4. If the draft adds CryptoPathX despite include_soft_promo=false, only flag it when the mention is unnatural, risky, exaggerated, or distracts from the answer.",
-    `5. Topic Agent reason: ${resolved.reason || "not provided"}`,
-    resolved.writerInstruction ? `6. Writer instruction: ${resolved.writerInstruction}` : null
+    "软广审核规则：",
+    "1. 这道已选题要不要软广，以选题 Agent 为准。",
+    "2. 选题 Agent 标记 include_soft_promo=false，所以不要只因为没有 Dudu 中转站就要求修改。",
+    "3. 对这道题来说，答案有用且切题时，不提产品是可以接受的。",
+    "4. 如果草稿在 include_soft_promo=false 时仍加了 Dudu 中转站，只有提及不自然、有风险、夸大，或抢走回答重心时，才标记。",
+    "5. 即使这道题不要求软广，正文出现 api.dududu.cloud 或 dududu.cloud 时，hardGate 仍必须 BLOCK。",
+    `6. 选题原因：${resolved.reason || "未提供"}`,
+    resolved.writerInstruction ? `7. 给写作 Agent 的指令：${resolved.writerInstruction}` : null
   ]
     .filter(Boolean)
     .join("\n");
@@ -385,7 +391,7 @@ function buildReviewCaseResearchPromptSuffix(caseResearch?: unknown) {
     : [];
 
   return [
-    "Backend case_research review rule:",
+    "后端 case_research 审核规则：",
     `1. should_use_case_research: ${record.should_use_case_research === true}`,
     typeof record.research_summary === "string" && record.research_summary.trim()
       ? `2. research_summary: ${record.research_summary.trim()}`
@@ -406,10 +412,10 @@ function buildReviewCaseResearchPromptSuffix(caseResearch?: unknown) {
           }))
         )}`
       : "3. case_materials: []",
-    "4. If writing_plan asks for cases and useful backend case_research exists, revise a draft that ignores it and stays generic without a safety reason.",
-    "5. If a case material is low-confidence or source_type=composite_hint, Writer must not state it as a verified real event, real friend story, or exact personal record.",
-    "6. Do not require source links in the final answer; judge whether the article uses the material cautiously and concretely.",
-    "7. If the draft copies source/reference wording or repeats one old user-provided case while backend case_research has other usable material, ask for revision."
+    "4. 如果写作计划要求案例，而且后端 case_research 有用，草稿却无视它、继续空泛写，又没有安全理由，要求修改。",
+    "5. 如果某条案例材料是低置信度，或 source_type=composite_hint，写作 Agent 不能把它写成已验证真实事件、真实朋友故事或精确个人记录。",
+    "6. 不要要求最终回答里必须放来源链接；判断文章有没有谨慎、具体地用这些材料。",
+    "7. 如果草稿抄了来源/参考原文，或反复复用一个旧的用户案例，而后端 case_research 还有其他可用材料，要求修改。"
   ]
     .filter(Boolean)
     .join("\n");
@@ -439,12 +445,12 @@ function buildReviewWritingPlanPromptSuffix(value: unknown) {
   const writerNotes = typeof plan.writer_notes === "string" ? plan.writer_notes : "";
 
   return [
-    "Topic Agent writing-plan review rule:",
-    "1. Topic Agent is allowed to decide this article's target length, structure, case usage, calculation usage, and list usage.",
-    "2. Review whether the draft substantially follows writing_plan, but do not demand mechanical section copying.",
+    "选题 Agent 写作计划审核规则：",
+    "1. 这篇文章的目标篇幅、结构、是否用案例、是否算账、是否用列表，允许由选题 Agent 决定。",
+    "2. 审核草稿有没有实质服从 writing_plan，但不要要求机械照抄章节。",
     `3. length_mode: ${lengthMode}`,
     targetMin || targetMax
-      ? `4. target length: at least ${targetMin || "unknown"} Chinese characters; ${targetMax || "unknown"} is a soft reference, not a hard cap.`
+      ? `4. 目标字数：至少 ${targetMin || "未知"} 个汉字；${targetMax || "未知"} 只是软参考，不是硬上限。`
       : null,
     structureMode ? `5. structure_mode: ${structureMode}` : null,
     `6. should_use_cases: ${shouldUseCases}`,
@@ -455,16 +461,16 @@ function buildReviewWritingPlanPromptSuffix(value: unknown) {
     boldTargets.length ? `11. bold_targets: ${boldTargets.join(" / ")}` : null,
     suggestedSections.length ? `12. suggested_sections: ${suggestedSections.join(" / ")}` : null,
     writerNotes ? `13. writer_notes: ${writerNotes}` : null,
-    "12. target_words_min is a hard lower bound. If the draft is below target_words_min, editorial.decision should be REVISE unless the writing_plan is clearly unsafe or impossible.",
-    "13. target_words_max is only a soft reference. Do not ask Writer to shorten a useful answer merely because it exceeds target_words_max.",
-    "14. If cases are requested, prefer realistic typical/composite cases with plausible and self-consistent data. Do not require fabricated real friends, real profit records, or unverifiable personal data.",
-    "14a. If should_use_cases=true, a case is under-developed when it only says abstract ideas like liquidity, chips, drawdown, or psychology without a concrete action chain.",
-    "14b. A publishable trading/crypto case should include most of these: time/price path or market setup, why the retail trader enters, position or budget, long/short temptation, stop-loss/take-profit action, emotional deformation, outcome pressure, and review takeaway.",
-    "14c. If topic/user/source context supplied a concrete case and the draft ignores it without a safety reason, ask for revision.",
-    "14d. User-provided examples are style/quality references, not reusable copy. If the draft copies reference wording or keeps reusing the same token/story arc across different topics when other cases are available, ask for revision.",
-    "15. If requested cases/calculation/list are missing or under-developed, ask for revision even if the answer is otherwise readable.",
-    "16. If should_use_bold=true and the draft has no meaningful **bold** emphasis on key conclusions/risk/calculation/principles, ask for revision.",
-    "17. Flag repeated formulaic openings/endings such as always using '先说结论' and '最后补一句' when they make the article feel templated."
+    "14. target_words_min 是硬下限。草稿低于 target_words_min 时，除非 writing_plan 明显不安全或做不到，否则 editorial.decision 应为 REVISE。",
+    "15. target_words_max 只是软参考。不要只因为超过它，就要求写作 Agent 把有用的回答缩短。",
+    "16. 需要案例时，优先接受接近真实、数据自洽的典型/复合案例。不要要求编造真实朋友、真实盈利记录或无法核验的个人数据。",
+    "17. should_use_cases=true 时，如果案例只说“访问不稳”“成本很高”这类抽象话，没有具体动作链，就算案例没写够。",
+    "18. 可发布的开发/API 接入案例应尽量包含：项目背景、用了哪些模型、具体卡点（限流、超时、账单惊吓、迁移需求）、试过什么、最终怎么选、还剩什么局限。",
+    "19. 如果题目/用户/来源上下文给了具体案例，草稿却无视它又没有安全理由，要求修改。",
+    "20. 用户给的范文只是文风/质量参考，不是可复用原文。如果草稿抄了参考原文，或在不同题目里反复复用同一套故事，而当时还有别的案例可用，要求修改。",
+    "21. 要求的案例/算账/列表缺失或明显没写够时，即使文章本身能读，也要求修改。",
+    "22. should_use_bold=true 时，如果草稿没有对关键结论/风险/算账/原则做有意义的 **加粗**，要求修改。",
+    "23. 反复使用“先说结论”“最后补一句”这类公式化开头结尾、让文章像模板时，要标出来。"
   ]
     .filter(Boolean)
     .join("\n");
@@ -517,6 +523,29 @@ function normalizeHardGate(value: Partial<ReviewStageResult> | null | undefined)
     decision: value?.decision === "BLOCK" ? "BLOCK" : "PASS",
     issues: normalizeStringArray(value?.issues),
     reason: typeof value?.reason === "string" ? value.reason : ""
+  };
+}
+
+function containsForbiddenRelayDomain(value?: string | null) {
+  return typeof value === "string" && /dududu\.cloud/i.test(value);
+}
+
+function applyForbiddenRelayDomainHardGate(
+  hardGate: ReviewStageResult,
+  ...texts: Array<string | null | undefined>
+): ReviewStageResult {
+  if (!texts.some((item) => containsForbiddenRelayDomain(item))) {
+    return hardGate;
+  }
+
+  return {
+    ...hardGate,
+    decision: "BLOCK",
+    issues: [
+      ...hardGate.issues.filter((item) => !/dududu\.cloud/i.test(item)),
+      "正文出现了禁止直写的 API 域名 dududu.cloud。需要给去处时只用文末参考文献 https://github.com/hehesama527/router-list 。"
+    ],
+    reason: "正文出现了禁止直写的 API 域名。"
   };
 }
 

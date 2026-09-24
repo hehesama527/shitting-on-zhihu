@@ -388,7 +388,14 @@ export class JobRepository {
     return rows.map(mapJobRow);
   }
 
-  async hasScheduledJobsInWindow(input: { start: Date; end: Date }): Promise<boolean> {
+  async hasScheduledJobsInWindow(input: { start: Date; end: Date; accountId?: number | null }): Promise<boolean> {
+    const params: Array<number | Date> = [input.start, input.end];
+    let accountClause = "";
+    if (input.accountId != null) {
+      accountClause = "AND pj.account_id = ?";
+      params.push(input.accountId);
+    }
+
     const [rows] = await this.pool.query<RowDataPacket[]>(
       `SELECT pj.id
        FROM publish_jobs pj
@@ -397,9 +404,10 @@ export class JobRepository {
          AND COALESCE(dps.scheduled_at, pj.scheduled_at) IS NOT NULL
          AND COALESCE(dps.scheduled_at, pj.scheduled_at) > ?
          AND COALESCE(dps.scheduled_at, pj.scheduled_at) <= ?
+         ${accountClause}
        ORDER BY COALESCE(dps.scheduled_at, pj.scheduled_at) ASC
        LIMIT 1`,
-      [input.start, input.end]
+      params
     );
 
     return rows.length > 0;

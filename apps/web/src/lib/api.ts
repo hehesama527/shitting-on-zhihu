@@ -24,6 +24,15 @@ import type {
   ToolTraceSummary,
   TopicBatchPlan,
   TopicListItem,
+  VideoFeedbackDocumentSummary,
+  VideoHubSummary,
+  VideoProjectDetail,
+  VideoProjectSummary,
+  VideoScriptPack,
+  VideoTargetPlatform,
+  VideoTopicBatchSummary,
+  VideoTopicCandidateSummary,
+  VisualRenderPlan,
   ZhihuNoteAgentApplyInput,
   ZhihuNoteAgentApplyResult,
   ZhihuNoteAgentDraft,
@@ -58,6 +67,7 @@ const CLIENT_IMAGE_API_BASE_URL = CLIENT_CONTROL_API_BASE_URL;
 
 declare global {
   interface Window {
+    __ZHIHU_MVP_API_BASE_URL__?: string;
     __ZHIHU_MVP_IMAGE_API_BASE_URL__?: string;
     __ZHIHU_MVP_CONTROL_API_BASE_URL__?: string;
   }
@@ -295,6 +305,170 @@ export async function postControlJson<T>(path: string, body?: unknown, method = 
     method,
     body: body ? JSON.stringify(body) : undefined
   });
+}
+
+export async function getVideoHubSummary() {
+  const data = await apiFetch<{ summary: VideoHubSummary }>("/video-hub/summary");
+  return data.summary;
+}
+
+export async function getVideoTopicBatches() {
+  const data = await apiFetch<{ batches: VideoTopicBatchSummary[] }>("/video-hub/topic-batches");
+  return data.batches;
+}
+
+export async function createVideoTopicBatch(input: {
+  source?: "weekly" | "hotspot" | "manual" | "platform_request" | "refill";
+  targetPlatform?: VideoTargetPlatform;
+  targetCount?: number;
+  productBrief?: string;
+  audience?: string;
+  userRequirement?: string;
+}) {
+  const data = await postJson<{ batch: VideoTopicBatchSummary | null }>("/video-hub/topic-batches", input);
+  return data.batch;
+}
+
+export async function refillVideoTopicBatch(batchId: string, input?: { targetCount?: number; userRequirement?: string }) {
+  const data = await postJson<{ batch: VideoTopicBatchSummary | null }>(`/video-hub/topic-batches/${batchId}/refill`, input ?? {});
+  return data.batch;
+}
+
+export async function getVideoTopicCandidates(batchId?: string | null) {
+  const data = await apiFetch<{ candidates: VideoTopicCandidateSummary[] }>(
+    `/video-hub/topic-candidates${buildQueryString({ batchId })}`
+  );
+  return data.candidates;
+}
+
+export async function saveVideoTopicFeedback(
+  candidateId: string,
+  input: {
+    decision: "hit" | "miss" | "not_now" | "duplicate" | "risky";
+    reason?: string;
+    suggestion?: string;
+  }
+) {
+  const data = await postJson<{ candidate: VideoTopicCandidateSummary | null }>(
+    `/video-hub/topic-candidates/${candidateId}/feedback`,
+    input
+  );
+  return data.candidate;
+}
+
+export async function scoreVideoHotspot(input: {
+  hotspot: Record<string, unknown>;
+  productBrief?: string;
+  audience?: string;
+  targetPlatform?: VideoTargetPlatform;
+}) {
+  const data = await postJson<{
+    result: {
+      topicFitScore: number;
+      productionScore: number;
+      score: number;
+      reason: string;
+      accepted: boolean;
+      batchId: string | null;
+    };
+  }>("/video-hub/hotspots/score", input);
+  return data.result;
+}
+
+export async function createVideoProject(input: { topicCandidateId: string; title?: string }) {
+  const data = await postJson<{ project: VideoProjectSummary | null }>("/video-hub/projects", input);
+  return data.project;
+}
+
+export async function getVideoProjects() {
+  const data = await apiFetch<{ projects: VideoProjectSummary[] }>("/video-hub/projects");
+  return data.projects;
+}
+
+export async function getVideoProject(projectId: string) {
+  const data = await apiFetch<{ project: VideoProjectDetail | null }>(`/video-hub/projects/${projectId}`);
+  return data.project;
+}
+
+export async function generateVideoScript(projectId: string, revisionInstruction = "") {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(`/video-hub/projects/${projectId}/script/generate`, {
+    revisionInstruction
+  });
+  return data.project;
+}
+
+export async function saveVideoScript(projectId: string, scriptPack: VideoScriptPack) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(
+    `/video-hub/projects/${projectId}/script`,
+    { scriptPack },
+    "PUT"
+  );
+  return data.project;
+}
+
+export async function confirmVideoScript(projectId: string) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(`/video-hub/projects/${projectId}/script/confirm`, {});
+  return data.project;
+}
+
+export async function generateVideoRenderPlan(projectId: string) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(
+    `/video-hub/projects/${projectId}/render-plan/generate`,
+    {}
+  );
+  return data.project;
+}
+
+export async function saveVideoRenderPlan(projectId: string, visualRenderPlan: VisualRenderPlan) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(
+    `/video-hub/projects/${projectId}/render-plan`,
+    { visualRenderPlan },
+    "PUT"
+  );
+  return data.project;
+}
+
+export async function confirmVideoRenderPlan(projectId: string) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(
+    `/video-hub/projects/${projectId}/render-plan/confirm`,
+    {}
+  );
+  return data.project;
+}
+
+export async function enqueueVideoAssets(projectId: string) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(`/video-hub/projects/${projectId}/assets/enqueue`, {});
+  return data.project;
+}
+
+export async function enqueueVideoComposition(projectId: string) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(`/video-hub/projects/${projectId}/compose`, {});
+  return data.project;
+}
+
+export async function approveVideoProject(projectId: string) {
+  const data = await postJson<{ project: VideoProjectDetail | null }>(`/video-hub/projects/${projectId}/approve`, {});
+  return data.project;
+}
+
+export function getVideoAssetContentUrl(assetId: string) {
+  const baseUrl =
+    typeof window !== "undefined" && window.__ZHIHU_MVP_API_BASE_URL__
+      ? window.__ZHIHU_MVP_API_BASE_URL__
+      : CLIENT_API_BASE_URL;
+  return `${baseUrl}/video-hub/assets/${assetId}/content`;
+}
+
+export async function createVideoFeedbackDocument(input: {
+  scope?: "global" | "topic" | "writer" | "visual" | "project";
+  projectId?: string | null;
+  notes?: string;
+}) {
+  const data = await postJson<{ document: { id: string; markdown: string; filePath?: string } }>(
+    "/video-hub/feedback-documents",
+    input
+  );
+  return data.document;
 }
 
 export async function createJob(accountId: number) {

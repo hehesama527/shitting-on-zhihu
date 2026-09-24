@@ -1,4 +1,4 @@
-import { chromium } from 'playwright';
+import { launchPersistentContext } from 'cloakbrowser';
 import path from 'path';
 import fs from 'fs/promises';
 import { existsSync } from 'fs';
@@ -50,15 +50,14 @@ async function runTest() {
   console.log('🌐 正在启动浏览器进行登录...');
   console.log('💡 提示：请在弹出的浏览器中完成知乎登录，完成后请在下方终端输入 "完成" 并回车。\n');
 
-  const browser = await chromium.launchPersistentContext(profileDir, {
+  const browser = await launchPersistentContext({
+    userDataDir: profileDir,
     headless: false,
-    channel: 'msedge',
     viewport: { width: 1440, height: 900 },
     args: [
       '--start-maximized',
       '--no-first-run',
       '--no-default-browser-check',
-      '--disable-blink-features=AutomationControlled',
       '--lang=zh-CN',
     ],
     locale: 'zh-CN',

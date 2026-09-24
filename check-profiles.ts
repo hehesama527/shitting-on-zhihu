@@ -2,7 +2,7 @@
  * 检查账号 Profile 的登录状态
  */
 
-import { chromium } from "playwright";
+import { launchPersistentContext } from "cloakbrowser";
 import path from "node:path";
 
 const ACCOUNTS = [
@@ -18,11 +18,10 @@ async function checkAccountProfile(account: typeof ACCOUNTS[0]) {
   
   let browser: any = null;
   try {
-    browser = await chromium.launchPersistentContext(profileDir, {
-      channel: "msedge",
+    browser = await launchPersistentContext({
+      userDataDir: profileDir,
       headless: true,
       viewport: { width: 1280, height: 720 },
-      args: ["--disable-blink-features=AutomationControlled"]
     });
     
     const page = browser.pages()[0] ?? (await browser.newPage());

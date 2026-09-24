@@ -402,10 +402,10 @@ export function getStealthInitScripts(profileSeed: string = 'default'): string[]
       const originalQuery = navigator.permissions.query;
       navigator.permissions.query = function(permission) {
         if (permission.name === 'notifications') {
-          return Promise.resolve({ state: 'granted', onchange: null } as PermissionStatus);
+          return Promise.resolve({ state: 'granted', onchange: null });
         }
         if (permission.name === 'midi' || permission.name === 'midi-sysex') {
-          return Promise.resolve({ state: 'prompt', onchange: null } as PermissionStatus);
+          return Promise.resolve({ state: 'prompt', onchange: null });
         }
         return originalQuery.call(this, permission);
       };

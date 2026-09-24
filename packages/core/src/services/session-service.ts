@@ -4,6 +4,7 @@ import { closeManualBrowserByPids, launchManualBrowser } from "../utils/chrome-m
 import { createManualLoginLock, readManualLoginLock, removeManualLoginLock } from "../utils/manual-login-lock.js";
 import { BrowserSkillService } from "./browser-skill-service.js";
 import { LlmService } from "./llm-service.js";
+import { LayaService } from "./laya-service.js";
 
 type SessionSnapshotInput = {
   url: string;
@@ -64,7 +65,8 @@ export class SessionStateError extends Error {
 export class SessionService {
   constructor(
     private readonly browserSkillService: BrowserSkillService,
-    private readonly llmService?: LlmService
+    private readonly llmService?: LlmService,
+    private readonly layaService: LayaService = new LayaService()
   ) {}
 
   async startManualLoginFlow(accountId: number, profileDir: string, returnUrl?: string | null) {
@@ -97,6 +99,9 @@ export class SessionService {
   async continueAfterManualLogin(accountId: number, publishJobId?: number) {
     await this.closeManualLoginBrowser(accountId);
     await this.browserSkillService.closeSession(`manual-login-${accountId}`);
+    if (publishJobId) {
+      await this.browserSkillService.closeSession(`publish-account-${accountId}-job-${publishJobId}`);
+    }
     await removeManualLoginLock(accountId);
 
     return {
@@ -219,6 +224,20 @@ export class SessionService {
     const heuristicResult = detectSessionStateHeuristically(input);
     if (heuristicResult) {
       return heuristicResult;
+    }
+
+    // 优先尝试本地 Laya 决策加速 (25ms)
+    try {
+      const layaResult = await this.layaService.detectSessionState(input);
+      if (layaResult && layaResult.session_state !== "unknown") {
+        return {
+          session_state: layaResult.session_state,
+          reason: layaResult.reason,
+          confidence: layaResult.confidence
+        };
+      }
+    } catch {
+      // 异常自动平滑降级至下方的 LLM 兜底
     }
 
     const fallback: Required<SessionDetectionResult> = {
@@ -575,12 +594,11 @@ function detectSessionStateHeuristically(input: SessionSnapshotInput): Required<
     "登录方式",
     "绑定手机",
     "绑定邮箱",
-    "写回答",
-    "查看我的回答",
-    "编辑回答",
     "创作中心",
+    "创作者中心",
     "发想法",
-    "私信"
+    "私信",
+    "消息"
   ];
   const isChallengeUrl = /zhihu\.com\/account\/unhuman|captcha|challenge/i.test(input.url);
   const isLoginUrl = /zhihu\.com\/signin|zhihu\.com\/login/i.test(input.url);
@@ -597,19 +615,19 @@ function detectSessionStateHeuristically(input: SessionSnapshotInput): Required<
     };
   }
 
-  if (isKnownLoggedInSurface || activeHints.some((text) => combinedText.includes(text))) {
-    return {
-      session_state: "active",
-      reason: "页面已显示知乎账号的已登录内容，可继续执行。",
-      confidence: "medium"
-    };
-  }
-
   if (isLoginUrl || loginHints.some((text) => combinedText.includes(text))) {
     return {
       session_state: "login_required",
       reason: "当前账号尚未登录知乎，请先完成登录后再确认恢复。",
       confidence: "high"
+    };
+  }
+
+  if (isKnownLoggedInSurface || activeHints.some((text) => combinedText.includes(text))) {
+    return {
+      session_state: "active",
+      reason: "页面已显示知乎账号的已登录内容，可继续执行。",
+      confidence: "medium"
     };
   }
 

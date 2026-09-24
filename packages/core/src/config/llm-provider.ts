@@ -48,7 +48,7 @@ export interface LlmRuntimeConfig {
   requestTimeoutMs: number;
 }
 
-export type LlmConfigScope = "zhihu" | "ops" | "x";
+export type LlmConfigScope = "zhihu" | "ops" | "x" | "video";
 export type LlmConfigTarget = LlmConfigScope | ModelCenterAgentName;
 
 export type ResolvedLlmRuntimeConfig = {
@@ -76,43 +76,52 @@ export function resolveLlmRuntimeConfig(target: LlmConfigTarget = "zhihu"): Reso
     ? readModelCenterAgentOverride(target)
     : createEmptyModelCenterOverrideFields();
   const scopedEnvOverrides = readScopedEnvOverrides(scope);
+  const model = pickAgentRuntimeValue(overrides.model, scopedEnvOverrides.model, baseResolution.runtime.model, baseResolution.fieldSources.model);
+  const baseUrl = pickAgentRuntimeValue(overrides.baseUrl, scopedEnvOverrides.baseUrl, baseResolution.runtime.baseUrl, baseResolution.fieldSources.baseUrl);
+  const apiKey = pickAgentRuntimeValue(overrides.apiKey, scopedEnvOverrides.apiKey, baseResolution.runtime.apiKey, baseResolution.fieldSources.apiKey);
+  const reasoningEffort = pickAgentRuntimeValue(
+    overrides.reasoningEffort,
+    scopedEnvOverrides.reasoningEffort,
+    baseResolution.runtime.reasoningEffort,
+    baseResolution.fieldSources.reasoningEffort
+  );
+  const wireApi = pickAgentRuntimeValue(
+    overrides.wireApi,
+    scopedEnvOverrides.wireApi,
+    baseResolution.runtime.wireApi,
+    baseResolution.fieldSources.wireApi
+  );
+  const requestTimeoutMs = pickAgentRuntimeValue(
+    overrides.requestTimeoutMs,
+    scopedEnvOverrides.requestTimeoutMs,
+    baseResolution.runtime.requestTimeoutMs,
+    baseResolution.fieldSources.requestTimeoutMs
+  );
 
   return {
     target,
     scope,
     runtime: {
       ...baseResolution.runtime,
-      model: scopedEnvOverrides.model ?? overrides.model ?? baseResolution.runtime.model,
-      baseUrl: scopedEnvOverrides.baseUrl ?? overrides.baseUrl ?? baseResolution.runtime.baseUrl,
-      apiKey: scopedEnvOverrides.apiKey ?? overrides.apiKey ?? baseResolution.runtime.apiKey,
-      reasoningEffort:
-        scopedEnvOverrides.reasoningEffort ?? overrides.reasoningEffort ?? baseResolution.runtime.reasoningEffort,
-      wireApi: scopedEnvOverrides.wireApi ?? overrides.wireApi ?? baseResolution.runtime.wireApi,
-      requestTimeoutMs:
-        scopedEnvOverrides.requestTimeoutMs ?? overrides.requestTimeoutMs ?? baseResolution.runtime.requestTimeoutMs
+      model: model.value,
+      baseUrl: baseUrl.value,
+      apiKey: apiKey.value,
+      reasoningEffort: reasoningEffort.value,
+      wireApi: wireApi.value,
+      requestTimeoutMs: requestTimeoutMs.value
     },
     fallbackRuntime: baseResolution.runtime,
     overrides,
     fallbackFieldSources: baseResolution.fieldSources,
     fieldSources: {
-      model: scopedEnvOverrides.model ? "env" : overrides.model ? "override" : baseResolution.fieldSources.model,
-      baseUrl: scopedEnvOverrides.baseUrl ? "env" : overrides.baseUrl ? "override" : baseResolution.fieldSources.baseUrl,
-      apiKey: scopedEnvOverrides.apiKey ? "env" : overrides.apiKey ? "override" : baseResolution.fieldSources.apiKey,
-      reasoningEffort:
-        scopedEnvOverrides.reasoningEffort
-          ? "env"
-          : overrides.reasoningEffort
-            ? "override"
-            : baseResolution.fieldSources.reasoningEffort,
-      wireApi: scopedEnvOverrides.wireApi ? "env" : overrides.wireApi ? "override" : baseResolution.fieldSources.wireApi,
-      requestTimeoutMs:
-        scopedEnvOverrides.requestTimeoutMs
-          ? "env"
-          : overrides.requestTimeoutMs
-            ? "override"
-            : baseResolution.fieldSources.requestTimeoutMs
+      model: model.source,
+      baseUrl: baseUrl.source,
+      apiKey: apiKey.source,
+      reasoningEffort: reasoningEffort.source,
+      wireApi: wireApi.source,
+      requestTimeoutMs: requestTimeoutMs.source
     },
-    apiKeySource: scopedEnvOverrides.apiKey ? "env" : overrides.apiKey ? "override" : baseResolution.apiKeySource,
+    apiKeySource: apiKey.source === "override" || apiKey.source === "env" || apiKey.source === "codex_auth" ? apiKey.source : baseResolution.apiKeySource,
     providerName: baseResolution.providerName
   };
 }
@@ -121,13 +130,28 @@ export function readLlmRuntimeConfig(target: LlmConfigTarget = "zhihu"): LlmRunt
   return resolveLlmRuntimeConfig(target).runtime;
 }
 
+const cloudflareSafeClientHeaders = {
+  // Dudu 前面的 Cloudflare 会按客户端特征拦截：Python-urllib 直接 1010，
+  // OpenAI SDK 自带的 OpenAI/JS 和 X-Stainless-* 会把连接挂死。curl 默认头可以直连通过。
+  "User-Agent": "curl/8.5.0",
+  "X-Stainless-Lang": null,
+  "X-Stainless-Package-Version": null,
+  "X-Stainless-OS": null,
+  "X-Stainless-Arch": null,
+  "X-Stainless-Runtime": null,
+  "X-Stainless-Runtime-Version": null,
+  "X-Stainless-Retry-Count": null,
+  "X-Stainless-Timeout": null
+};
+
 export function createOpenAiClient(target: LlmConfigTarget = "zhihu") {
   const runtime = readLlmRuntimeConfig(target);
   return new OpenAI({
     apiKey: runtime.apiKey,
     baseURL: runtime.baseUrl,
     httpAgent: createProxyAgent(runtime.proxyUrl),
-    timeout: runtime.requestTimeoutMs
+    timeout: runtime.requestTimeoutMs,
+    defaultHeaders: cloudflareSafeClientHeaders
   });
 }
 
@@ -203,6 +227,8 @@ function readScopedEnv(scope: LlmConfigScope, name: string) {
   const candidates =
     scope === "ops"
       ? [`OPS_AGENT_${name}`, `ZHIHU_AGENT_${name}`, `LLM_${name}`]
+      : scope === "video"
+        ? [`VIDEO_AGENT_${name}`, `LLM_${name}`, `ZHIHU_AGENT_${name}`]
       : scope === "x"
         ? [`X_AGENT_${name}`, `LLM_${name}`, `ZHIHU_AGENT_${name}`]
         : [`ZHIHU_AGENT_${name}`, `LLM_${name}`];
@@ -347,6 +373,32 @@ function normalizeRequestTimeout(value: string | null) {
   return null;
 }
 
+function pickAgentRuntimeValue<T>(
+  overrideValue: T | null,
+  envValue: T | null,
+  fallbackValue: T,
+  fallbackSource: ModelCenterFieldSource
+): { value: T; source: ModelCenterFieldSource } {
+  if (overrideValue != null && overrideValue !== "") {
+    return {
+      value: overrideValue,
+      source: "override"
+    };
+  }
+
+  if (envValue != null && envValue !== "") {
+    return {
+      value: envValue,
+      source: "env"
+    };
+  }
+
+  return {
+    value: fallbackValue,
+    source: fallbackSource
+  };
+}
+
 function resolveProxyUrl() {
   const proxyValue = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY ?? process.env.ALL_PROXY;
   if (!proxyValue) {
@@ -388,7 +440,7 @@ function createProxyAgent(proxyUrl: string | null): Agent | undefined {
 }
 
 function isLlmConfigScope(value: string): value is LlmConfigScope {
-  return value === "zhihu" || value === "ops" || value === "x";
+  return value === "zhihu" || value === "ops" || value === "x" || value === "video";
 }
 
 function isModelCenterAgentName(value: string): value is ModelCenterAgentName {

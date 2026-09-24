@@ -54,7 +54,13 @@ export type PromptSetName =
   | "x_traditional_writer_agent"
   | "x_traditional_review_agent"
   | "x_traditional_publish_agent"
-  | "x_traditional_note_agent";
+  | "x_traditional_note_agent"
+  | "video_topic_agent"
+  | "video_writer_agent"
+  | "video_review_agent"
+  | "video_visual_planner"
+  | "video_motion_planner"
+  | "video_feedback_agent";
 
 export const llmReasoningEfforts = ["low", "medium", "high"] as const;
 export type LlmReasoningEffort = (typeof llmReasoningEfforts)[number];
@@ -80,12 +86,18 @@ export const modelCenterAgentNames = [
   "x_traditional_review_agent",
   "x_traditional_publish_agent",
   "x_traditional_note_agent",
+  "video_topic_agent",
+  "video_writer_agent",
+  "video_review_agent",
+  "video_visual_planner",
+  "video_motion_planner",
+  "video_feedback_agent",
   "ops_agent"
 ] as const;
 
 export type ModelCenterAgentName = (typeof modelCenterAgentNames)[number];
-export type ModelCenterAgentGroup = "zhihu" | "x" | "system";
-export type ModelCenterAgentScope = "zhihu" | "x" | "ops";
+export type ModelCenterAgentGroup = "zhihu" | "x" | "video" | "system";
+export type ModelCenterAgentScope = "zhihu" | "x" | "video" | "ops";
 
 export type ModelCenterGroupDefinition = {
   key: ModelCenterAgentGroup;
@@ -103,6 +115,11 @@ export const modelCenterGroupDefinitions: ModelCenterGroupDefinition[] = [
     key: "x",
     label: "X 链路",
     description: "负责研究、写作、审核和发布的 X 独立链路。"
+  },
+  {
+    key: "video",
+    label: "Video Hub",
+    description: "Platform-neutral video production agents for topics, scripts, visual plans, and feedback."
   },
   {
     key: "system",
@@ -258,6 +275,54 @@ export const modelCenterAgentDefinitions: ModelCenterAgentDefinition[] = [
     description: "Manually fills and updates account-specific RAG rule documents for the traditional X chain."
   },
   {
+    name: "video_topic_agent",
+    label: "Video Topic Agent",
+    shortLabel: "Video Topic",
+    group: "video",
+    scope: "video",
+    description: "Generates weekly video topic candidates and scores hotspot-topic fit."
+  },
+  {
+    name: "video_writer_agent",
+    label: "Video Writer Agent",
+    shortLabel: "Video Writer",
+    group: "video",
+    scope: "video",
+    description: "Turns selected topics into horizontal video scripts, segments, subtitles, and image prompts."
+  },
+  {
+    name: "video_review_agent",
+    label: "Video Review Agent",
+    shortLabel: "Evidence Review",
+    group: "video",
+    scope: "video",
+    description: "Reviews real market-data case evidence and produces verified facts, findings, hypotheses, and safety boundaries."
+  },
+  {
+    name: "video_visual_planner",
+    label: "Video Visual Planner",
+    shortLabel: "Visual Plan",
+    group: "video",
+    scope: "video",
+    description: "Chooses visual builders such as GPT image, Hyperframe, Remotion cards, or existing assets."
+  },
+  {
+    name: "video_motion_planner",
+    label: "Video Motion Planner",
+    shortLabel: "Motion Plan",
+    group: "video",
+    scope: "video",
+    description: "Turns script, voice timing, verified evidence, and visual assets into reusable motion scenes."
+  },
+  {
+    name: "video_feedback_agent",
+    label: "Video Feedback Agent",
+    shortLabel: "Feedback",
+    group: "video",
+    scope: "video",
+    description: "Summarizes operator feedback into reusable documents for topic and writing improvement."
+  },
+  {
     name: "ops_agent",
     label: "运维诊断代理",
     shortLabel: "运维",
@@ -380,6 +445,438 @@ export type UpdateModelCenterInput = {
   models: ModelCenterSavedModel[];
   agentBindings: ModelCenterAgentBinding[];
   agents?: ModelCenterAgentOverride[];
+};
+
+export type VideoTargetPlatform = "agnostic" | "x" | "zhihu" | "douyin" | "xiaohongshu" | "bilibili" | "manual";
+export type VideoAspectRatio = "16:9";
+export type VideoTopicSource = "weekly" | "hotspot" | "manual" | "platform_request" | "refill";
+export type VideoTopicCandidateStatus =
+  | "pending_feedback"
+  | "selected"
+  | "rejected"
+  | "deferred"
+  | "project_created"
+  | "expired";
+export type VideoTopicFeedbackDecision = "hit" | "miss" | "not_now" | "duplicate" | "risky";
+export type VideoProjectStatus =
+  | "topic_selected"
+  | "writing"
+  | "script_pending_confirmation"
+  | "render_plan_pending_confirmation"
+  | "script_confirmed"
+  | "assets_pending"
+  | "voice_rendering"
+  | "visual_rendering"
+  | "assets_ready"
+  | "composing"
+  | "video_ready"
+  | "video_review_required"
+  | "approved"
+  | "failed"
+  | "archived";
+export type VideoSegmentStatus =
+  | "planned"
+  | "script_ready"
+  | "script_confirmed"
+  | "voice_pending"
+  | "voice_rendering"
+  | "voice_ready"
+  | "visual_pending"
+  | "visual_rendering"
+  | "visual_ready"
+  | "ready"
+  | "failed"
+  | "superseded";
+export type VideoAssetType =
+  | "voice"
+  | "image"
+  | "chart"
+  | "text_card"
+  | "subtitle"
+  | "video"
+  | "composition"
+  | "motion_plan";
+export type VideoAssetStatus = "pending" | "rendering" | "active" | "superseded" | "failed";
+export type VideoRenderBuilder = "gpt_image" | "hyperframe" | "remotion_card" | "existing_asset" | "mixed";
+export type VideoTaskKind = "voice" | "visual" | "compose";
+export type VideoCaseIntentStatus = "requested" | "evidence_running" | "evidence_ready" | "review_failed" | "abandoned";
+export type VideoVerifiedCasePackStatus = "ready" | "ready_with_warnings" | "insufficient_evidence" | "failed";
+export type VideoCaseDataSource = "cryptopathx_mongo";
+export type VideoCaseStrategyName = "sma_crossover";
+
+export type VideoCaseStrategyConfig = {
+  name: VideoCaseStrategyName;
+  fastWindow: number;
+  slowWindow: number;
+  side: "long_only";
+};
+
+export type VideoCaseAssumptions = {
+  initialCapital: number;
+  feeBpsEachSide: number;
+  slippageBpsEachSide: number;
+};
+
+export type VideoCaseIntentRequest = {
+  dataSource?: VideoCaseDataSource;
+  symbol: string;
+  interval: string;
+  startTime: string;
+  endTime: string;
+  collectionName?: string | null;
+  strategy?: Partial<VideoCaseStrategyConfig>;
+  assumptions?: Partial<VideoCaseAssumptions>;
+  requestedCase?: string;
+  notes?: string;
+};
+
+export type VideoCaseIntentSummary = {
+  id: string;
+  projectId: string;
+  status: VideoCaseIntentStatus;
+  dataSource: VideoCaseDataSource;
+  symbol: string;
+  interval: string;
+  collectionName: string | null;
+  startTime: string;
+  endTime: string;
+  strategyName: VideoCaseStrategyName;
+  strategyParams: VideoCaseStrategyConfig;
+  assumptions: VideoCaseAssumptions;
+  requestJson: Record<string, unknown>;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VideoVerifiedCasePack = {
+  caseId: string;
+  status: VideoVerifiedCasePackStatus;
+  createdAt: string;
+  dataSource: Record<string, unknown>;
+  caseIntent: Record<string, unknown>;
+  strategy: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  review: {
+    allowedFacts: string[];
+    findings: string[];
+    hypotheses: string[];
+    forbiddenClaims: string[];
+    contentSafety: {
+      mustSay: string[];
+    };
+    reviewScore?: number;
+    warnings?: string[];
+  };
+  chartData: Record<string, unknown>;
+};
+
+export type VideoVerifiedCasePackSummary = {
+  id: string;
+  projectId: string;
+  caseIntentId: string;
+  caseId: string;
+  status: VideoVerifiedCasePackStatus;
+  dataSource: Record<string, unknown>;
+  strategy: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  review: VideoVerifiedCasePack["review"];
+  chartData: Record<string, unknown>;
+  pack: VideoVerifiedCasePack;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VideoTopicCandidateInput = {
+  title: string;
+  brief: string;
+  angle: string;
+  videoFormat: "opinion" | "data_explain" | "tutorial" | "case_breakdown" | "product_explain" | "mixed";
+  targetAudience: string;
+  whyThis: string;
+  estimatedDurationSec?: number | null;
+  score: number;
+  topicFitScore?: number | null;
+  productionScore?: number | null;
+  scoreBreakdown?: Record<string, number>;
+  riskNotes?: string[];
+  sourceRefs?: string[];
+};
+
+export type VideoTopicBatchOutput = {
+  summary: string;
+  candidates: VideoTopicCandidateInput[];
+};
+
+export type VideoTopicCandidateSummary = VideoTopicCandidateInput & {
+  id: string;
+  batchId: string;
+  source: VideoTopicSource;
+  targetPlatform: VideoTargetPlatform;
+  status: VideoTopicCandidateStatus;
+  createdAt: string;
+  updatedAt: string;
+  latestFeedbackDecision: VideoTopicFeedbackDecision | null;
+};
+
+export type VideoTopicBatchSummary = {
+  id: string;
+  source: VideoTopicSource;
+  status: "pending_feedback" | "completed" | "failed";
+  targetPlatform: VideoTargetPlatform;
+  targetCount: number;
+  generatedCount: number;
+  selectedCount: number;
+  summary: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VideoScriptSegment = {
+  segmentId: string;
+  order: number;
+  title: string;
+  voiceover: string;
+  subtitle: string;
+  durationSec: number;
+  imagePrompt: string;
+  visualIntent: string;
+  needsChart?: boolean;
+  chartSpec?: Record<string, unknown> | null;
+};
+
+export type VideoScriptPack = {
+  title: string;
+  topicId: string;
+  aspectRatio: VideoAspectRatio;
+  targetDurationSec: number;
+  voiceoverFullText: string;
+  segments: VideoScriptSegment[];
+  coverTitle?: string;
+  cta?: string;
+  riskNotes?: string[];
+};
+
+export type VisualRenderPlanSegment = {
+  segmentId: string;
+  order: number;
+  builder: VideoRenderBuilder;
+  reason: string;
+  imagePrompt?: string | null;
+  chartSpec?: Record<string, unknown> | null;
+  cardSpec?: Record<string, unknown> | null;
+  existingAssetId?: string | null;
+  blockingIssue?: string | null;
+};
+
+export type VisualRenderPlan = {
+  projectId: string;
+  aspectRatio: VideoAspectRatio;
+  resolution: {
+    width: number;
+    height: number;
+  };
+  segments: VisualRenderPlanSegment[];
+  notes?: string[];
+};
+
+export type VideoMotionSceneType =
+  | "hook_curve_warning"
+  | "real_market_chart"
+  | "ma_crossover_rule"
+  | "single_window_result"
+  | "window_comparison"
+  | "market_weather"
+  | "diagnostic_cards"
+  | "product_workflow"
+  | "closing_standard"
+  | "text_card"
+  | "image_explainer";
+
+export type VideoMotionDataRefType =
+  | "none"
+  | "verified_case_pack"
+  | "market_window"
+  | "market_window_comparison"
+  | "script_segment"
+  | "asset";
+
+export type VideoMotionOverlayRole = "headline" | "subhead" | "callout" | "metric" | "warning" | "caption";
+export type VideoMotionOverlayPosition =
+  | "top_left"
+  | "top_center"
+  | "top_right"
+  | "center"
+  | "lower_left"
+  | "lower_center"
+  | "lower_right";
+export type VideoMotionCamera = "none" | "push_in" | "pull_back" | "pan_left" | "pan_right" | "track_chart";
+export type VideoMotionTransition = "cut" | "fade" | "match_cut" | "wipe" | "slide";
+export type VideoMotionChartDraw = "none" | "continuous" | "candlestick_build" | "line_trace" | "bar_reveal";
+export type VideoMotionEmphasis =
+  | "none"
+  | "last_price_dot"
+  | "crossover_marker"
+  | "result_delta"
+  | "risk_badge"
+  | "workflow_step";
+
+export type VideoMotionOverlay = {
+  text: string;
+  role: VideoMotionOverlayRole;
+  position: VideoMotionOverlayPosition;
+  startMs?: number;
+  endMs?: number;
+};
+
+export type VideoMotionDataRef = {
+  type: VideoMotionDataRefType;
+  key?: string | null;
+  source?: string | null;
+  label?: string | null;
+};
+
+export type VideoMotionConfig = {
+  transition: VideoMotionTransition;
+  camera: VideoMotionCamera;
+  chartDraw: VideoMotionChartDraw;
+  emphasis: VideoMotionEmphasis;
+  layerAnimations?: string[];
+};
+
+export type VideoMotionQaRule = {
+  ruleId: string;
+  severity: "error" | "warning";
+  description: string;
+  target: "plan" | "scene" | "asset" | "subtitle";
+};
+
+export type VideoMotionDataBinding = {
+  key: string;
+  type: VideoMotionDataRefType;
+  source: string;
+  label: string;
+  required: boolean;
+  fallbackSceneType?: VideoMotionSceneType;
+  notes?: string;
+};
+
+export type VideoMotionScene = {
+  sceneId: string;
+  segmentId: string;
+  segmentKey: string;
+  order: number;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  sceneType: VideoMotionSceneType;
+  narrationIntent: string;
+  dataRef: VideoMotionDataRef;
+  visualFocus: string;
+  textOverlays: VideoMotionOverlay[];
+  motion: VideoMotionConfig;
+  requiredAssetTypes: VideoAssetType[];
+  qaRules: VideoMotionQaRule[];
+};
+
+export type VideoMotionPlan = {
+  version: "motion-plan-v1";
+  projectId: string;
+  title: string;
+  aspectRatio: VideoAspectRatio;
+  resolution: {
+    width: number;
+    height: number;
+  };
+  totalDurationMs: number;
+  maxSceneDurationMs: number;
+  generatedAt: string;
+  source: {
+    planner: "deterministic_v1" | "agent_refined";
+    inputs: string[];
+  };
+  dataBindings: VideoMotionDataBinding[];
+  scenes: VideoMotionScene[];
+  qaRules: VideoMotionQaRule[];
+  notes: string[];
+};
+
+export type VideoProjectSummary = {
+  id: string;
+  topicCandidateId: string;
+  title: string;
+  status: VideoProjectStatus;
+  targetPlatform: VideoTargetPlatform;
+  aspectRatio: VideoAspectRatio;
+  targetDurationSec: number | null;
+  scriptConfirmedAt: string | null;
+  visualRenderPlanConfirmedAt: string | null;
+  finalVideoAssetId: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VideoProjectSegmentSummary = {
+  id: string;
+  projectId: string;
+  segmentKey: string;
+  order: number;
+  title: string;
+  voiceover: string;
+  subtitle: string;
+  imagePrompt: string;
+  visualBuilder: VideoRenderBuilder | null;
+  status: VideoSegmentStatus;
+  durationSec: number;
+  errorMessage: string | null;
+  updatedAt: string;
+};
+
+export type VideoAssetSummary = {
+  id: string;
+  projectId: string;
+  segmentId: string | null;
+  assetType: VideoAssetType;
+  status: VideoAssetStatus;
+  builder: VideoRenderBuilder | null;
+  filePath: string | null;
+  publicUrl: string | null;
+  mimeType: string | null;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  attemptNo: number;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VideoProjectDetail = VideoProjectSummary & {
+  topic: VideoTopicCandidateSummary | null;
+  scriptPack: VideoScriptPack | null;
+  visualRenderPlan: VisualRenderPlan | null;
+  segments: VideoProjectSegmentSummary[];
+  assets: VideoAssetSummary[];
+  caseIntents?: VideoCaseIntentSummary[];
+  verifiedCasePacks?: VideoVerifiedCasePackSummary[];
+};
+
+export type VideoFeedbackDocumentSummary = {
+  id: string;
+  scope: "global" | "topic" | "writer" | "visual" | "project";
+  markdown: string;
+  summaryJson: Record<string, unknown> | null;
+  createdAt: string;
+};
+
+export type VideoHubSummary = {
+  topicBatches: VideoTopicBatchSummary[];
+  candidates: VideoTopicCandidateSummary[];
+  projects: VideoProjectSummary[];
+  feedbackDocuments: VideoFeedbackDocumentSummary[];
 };
 
 export type FailureType =
@@ -950,6 +1447,7 @@ export type WorkerTickSummary = {
   generatedSlots: number;
   harvestedCandidates: number;
   preparedJobs: number;
+  inFlightPrepareJobs?: number;
   processedJobs: number;
   blockedByLogin: boolean;
   accountStatus: string;

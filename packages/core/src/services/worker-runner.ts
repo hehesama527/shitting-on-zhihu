@@ -7,6 +7,8 @@ import { TopicRepository } from "../repositories/topic-repository.js";
 import { getElapsedMs, logDebugTiming } from "../utils/debug-timing.js";
 import { safeParseJson } from "../utils/json.js";
 import { hasManualLoginLock } from "../utils/manual-login-lock.js";
+import { isRetryableLockError } from "../utils/mysql-retry.js";
+import { withTimeoutReject } from "../utils/with-timeout.js";
 import { AccountSoulService } from "./account-soul-service.js";
 import { FeishuNotificationService } from "./feishu-notification-service.js";
 import { FailureResolutionService } from "./failure-resolution-service.js";
@@ -17,6 +19,11 @@ import { ScheduleService } from "./schedule-service.js";
 import { SessionStateError } from "./session-service.js";
 import type { AccountPromptContext } from "./account-prompt-context.js";
 import { TopicDiscoveryService } from "./topic-discovery-service.js";
+import {
+  planTopicAssignments,
+  SHARED_TOPIC_BATCH_SIZE,
+  shouldHarvestSharedTopicBatch
+} from "./topic-harvest-assign.js";
 import { TopicPipelineService } from "./topic-pipeline-service.js";
 
 type TickBranchResult = {
@@ -31,13 +38,17 @@ type PrepareJobResult = {
 };
 
 type WorkerAccount = NonNullable<Awaited<ReturnType<AccountRepository["getAccount"]>>>;
-const MAX_PREPARE_JOBS_PER_TICK = 3;
+const MAX_PREPARE_CONCURRENCY = 3;
+const MAX_PREPARE_JOBS_PER_ACCOUNT = 1;
+const PREPARE_CANDIDATE_FETCH_LIMIT = 30;
 const PREPARE_WINDOW_MINUTES = 120;
-const HARVEST_SKIP_WINDOW_MINUTES = 30;
-const PUBLISH_ATTEMPT_TIMEOUT_MS = 180_000;
+const PUBLISH_ATTEMPT_TIMEOUT_MS = 600_000;
+const HARVEST_TIMEOUT_MS = 8 * 60 * 1000;
+const CHALLENGE_PAGE_KEEP_OPEN_MS = 15 * 60 * 1000;
 
 export class WorkerRunner {
   private readonly accountSoulService = new AccountSoulService();
+  private readonly inFlightPrepareJobs = new Map<number, { accountId: number; promise: Promise<void> }>();
 
   constructor(
     private readonly scheduleService: ScheduleService,
@@ -66,7 +77,6 @@ export class WorkerRunner {
 
     const accountsById = new Map<number, WorkerAccount>(accounts.map((account) => [account.id, account]));
     const blockedAccountIds = new Set<number>();
-    const blockedRiskDomains = new Set<string>();
     const blockedMessages: string[] = [];
     const runnableAccounts: WorkerAccount[] = [];
 
@@ -74,14 +84,7 @@ export class WorkerRunner {
       const manualLoginLocked = await hasManualLoginLock(account.id);
       if (isLoginBlockedAccount(account) || manualLoginLocked || isCoolingDown(account)) {
         blockedAccountIds.add(account.id);
-        blockedRiskDomains.add(account.riskDomain);
         blockedMessages.push(resolveAccountBlockMessage(account, { manualLoginLocked }));
-        continue;
-      }
-
-      if (blockedRiskDomains.has(account.riskDomain)) {
-        blockedAccountIds.add(account.id);
-        blockedMessages.push(buildRiskDomainBlockedMessage(account));
         continue;
       }
 
@@ -101,7 +104,6 @@ export class WorkerRunner {
     });
 
     const dueJobs = await this.jobRepository.getDueJobs();
-    const hasDuePublishJobs = dueJobs.length > 0;
     logDebugTiming("worker.tick", "loaded_due_jobs", {
       elapsedMs: getElapsedMs(tickStartedAt),
       dueJobs: dueJobs.map((job) => ({ id: job.id, status: job.status, scheduledAt: job.scheduledAt }))
@@ -110,95 +112,45 @@ export class WorkerRunner {
       dueJobs,
       accountsById,
       blockedAccountIds,
-      blockedRiskDomains,
       blockedMessages
     );
     logDebugTiming("worker.tick", "processed_due_jobs", {
       elapsedMs: getElapsedMs(tickStartedAt),
       processedJobs: processResult.processedJobs
     });
-    const prepareResult = hasDuePublishJobs
-      ? { preparedJobs: 0 }
-      : await this.prepareQueuedJobs(accountsById, blockedAccountIds, blockedRiskDomains, blockedMessages);
-    const blockedByLogin = blockedAccountIds.size > 0;
-    logDebugTiming("worker.tick", "finished_prepare", {
+
+    const reopenedLockFailures = await this.scheduleRepository.reopenRetryableLockFailedSlots();
+    if (reopenedLockFailures > 0) {
+      console.warn("[worker] reopened deadlock-failed slots", { count: reopenedLockFailures });
+    }
+
+    const emptyPoolAccountIds = await this.listEmptyPoolAccountIds(runnableAccounts, blockedAccountIds);
+    const prepareResult = await this.kickPrepareQueuedJobs(accountsById, blockedAccountIds, emptyPoolAccountIds);
+    logDebugTiming("worker.tick", "kicked_prepare", {
       elapsedMs: getElapsedMs(tickStartedAt),
       preparedJobs: prepareResult.preparedJobs,
+      inFlightPrepareJobs: prepareResult.inFlightPrepareJobs,
+      emptyPoolAccounts: emptyPoolAccountIds.size,
       blockedAccounts: blockedAccountIds.size
     });
 
-    let harvestedCandidates = 0;
-    const harvestCheckStart = new Date();
-    const hasImminentJobs = hasDuePublishJobs
-      ? true
-      : await this.jobRepository.hasScheduledJobsInWindow({
-          start: harvestCheckStart,
-          end: addMinutes(harvestCheckStart, HARVEST_SKIP_WINDOW_MINUTES)
-        });
-    logDebugTiming("worker.tick", "resolved_harvest_window", {
-      elapsedMs: getElapsedMs(tickStartedAt),
-      hasImminentJobs,
-      hasDuePublishJobs,
-      preparedJobs: prepareResult.preparedJobs
-    });
-
-    if (!hasImminentJobs && prepareResult.preparedJobs === 0) {
-      for (const account of runnableAccounts) {
-        if (!account.profileDir || blockedAccountIds.has(account.id) || blockedRiskDomains.has(account.riskDomain)) {
-          if (!blockedAccountIds.has(account.id) && blockedRiskDomains.has(account.riskDomain)) {
-            blockedAccountIds.add(account.id);
-            blockedMessages.push(buildRiskDomainBlockedMessage(account));
-          }
-          continue;
-        }
-
-        try {
-          const harvestStartedAt = Date.now();
-          const soulContext = await this.accountSoulService.ensureSoulDocument(account);
-          logDebugTiming("worker.tick", "harvest_start", {
-            accountId: account.id
-          });
-          harvestedCandidates += await this.topicDiscoveryService.harvestCandidates({
-            accountId: account.id,
-            profileDir: account.profileDir,
-            accountContext: toAccountPromptContext(account),
-            accountSoulMarkdown: soulContext.markdown
-          });
-          logDebugTiming("worker.tick", "harvest_done", {
-            accountId: account.id,
-            elapsedMs: getElapsedMs(harvestStartedAt),
-            harvestedCandidates
-          });
-        } catch (error) {
-          if (error instanceof SessionStateError) {
-            await this.pauseAccountForLogin(account.id, error.message, {
-              failureType: mapSessionFailureType(error.sessionState),
-              triggerStage: "topic_discovery"
-            });
-            blockedAccountIds.add(account.id);
-            blockedRiskDomains.add(account.riskDomain);
-            blockedMessages.push(error.message);
-            accountsById.set(account.id, {
-              ...account,
-              status: "manual_login_required",
-              statusReason: error.message
-            });
-            continue;
-          }
-
-          console.error("[worker] topic discovery failed", error);
-        }
-      }
-    }
-    logDebugTiming("worker.tick", "finished_harvest", {
+    const harvestedCandidates = await this.harvestSharedTopicBatch(
+      runnableAccounts,
+      accountsById,
+      blockedAccountIds,
+      blockedMessages
+    );
+    logDebugTiming("worker.tick", "finished_shared_harvest", {
       elapsedMs: getElapsedMs(tickStartedAt),
       harvestedCandidates
     });
+    const blockedByLogin = blockedAccountIds.size > 0;
 
     const summary = {
       generatedSlots,
       harvestedCandidates,
       preparedJobs: prepareResult.preparedJobs,
+      inFlightPrepareJobs: prepareResult.inFlightPrepareJobs,
       processedJobs: processResult.processedJobs,
       blockedByLogin,
       accountStatus: resolveTickAccountStatus(accounts.length, blockedAccountIds.size),
@@ -318,10 +270,20 @@ export class WorkerRunner {
     };
   }
 
+  async waitForInFlightPrepares() {
+    await Promise.allSettled(
+      [...this.inFlightPrepareJobs.values()].map((entry) => entry.promise)
+    );
+  }
+
+  async closeAllSessions() {
+    await this.publishService.closeAllSessions();
+  }
+
   private async fillScheduleSlots(account: WorkerAccount) {
     const startedAt = Date.now();
     let createdJobs = 0;
-    const soulDocument = await this.accountSoulService.ensureSoulDocument(account);
+    const soulDocument = await this.ensureAccountSoulDocument(account);
 
     while (true) {
       const slot = await this.scheduleService.getNextUnassignedSlot(account.id);
@@ -330,7 +292,7 @@ export class WorkerRunner {
       }
 
       const promptSnapshot = await this.llmService.getPromptSnapshotForAccount({
-        writerPromptVersionId: account.writerPromptVersionId
+        writerPromptVersionId: await this.resolveWriterPromptVersionId(account)
       });
       const promptSnapshotJson = JSON.stringify(promptSnapshot);
 
@@ -354,66 +316,208 @@ export class WorkerRunner {
     return createdJobs;
   }
 
-  private async prepareQueuedJobs(
+  private async listEmptyPoolAccountIds(accounts: WorkerAccount[], blockedAccountIds: Set<number>) {
+    const emptyPoolAccountIds = new Set<number>();
+    for (const account of accounts) {
+      if (blockedAccountIds.has(account.id)) {
+        continue;
+      }
+      const activeCount = await this.topicRepository.countActiveCandidates(account.id);
+      if (activeCount <= 0) {
+        emptyPoolAccountIds.add(account.id);
+      }
+    }
+    return emptyPoolAccountIds;
+  }
+
+  private async harvestSharedTopicBatch(
+    accounts: WorkerAccount[],
     accountsById: Map<number, WorkerAccount>,
     blockedAccountIds: Set<number>,
-    blockedRiskDomains: Set<string>,
     blockedMessages: string[]
-  ): Promise<{ preparedJobs: number }> {
-    const startedAt = Date.now();
-    const jobs = await this.jobRepository.getJobsNeedingPreparation(MAX_PREPARE_JOBS_PER_TICK, {
+  ): Promise<number> {
+    const demand = await this.listTopicDemand(accounts, blockedAccountIds);
+    const totalDemand = demand.reduce((sum, item) => sum + item.neededCount, 0);
+    if (totalDemand <= 0) {
+      return 0;
+    }
+
+    const accountIds = demand.map((item) => item.accountId);
+    let holders = await this.topicRepository.listOpenCandidateHolders(accountIds);
+    let assigned = await this.applyTopicAssignments(holders, demand);
+    holders = await this.topicRepository.listOpenCandidateHolders(accountIds);
+
+    const openByAccount = countHoldersByAccount(holders);
+    const emptyDemandAccounts = demand.filter((item) => (openByAccount.get(item.accountId) ?? 0) <= 0).length;
+    if (
+      !shouldHarvestSharedTopicBatch({
+        totalOpenCandidates: holders.length,
+        totalDemand,
+        emptyDemandAccounts,
+        batchSize: SHARED_TOPIC_BATCH_SIZE
+      })
+    ) {
+      return assigned;
+    }
+
+    const browserAccount = pickHarvestBrowserAccount(accounts, blockedAccountIds, demand);
+    if (!browserAccount?.profileDir) {
+      return assigned;
+    }
+
+    try {
+      const harvestStartedAt = Date.now();
+      const soulContext = await this.ensureAccountSoulDocument(browserAccount);
+      console.warn("[worker] harvesting shared topic batch", {
+        accountId: browserAccount.id,
+        accountName: browserAccount.name,
+        totalDemand,
+        currentOpen: holders.length,
+        distributeTo: accountIds
+      });
+      assigned += await withTimeoutReject(
+        this.topicDiscoveryService.harvestCandidates({
+          accountId: browserAccount.id,
+          profileDir: browserAccount.profileDir,
+          accountContext: toAccountPromptContext(browserAccount),
+          accountSoulMarkdown: soulContext.markdown,
+          fillSharedBatch: true
+        }),
+        HARVEST_TIMEOUT_MS,
+        "共享采题超时，已释放浏览器并继续写稿。",
+        () => this.publishService.closeAllSessions()
+      );
+      logDebugTiming("worker.tick", "shared_harvest_done", {
+        accountId: browserAccount.id,
+        elapsedMs: getElapsedMs(harvestStartedAt),
+        harvestedCandidates: assigned
+      });
+    } catch (error) {
+      if (error instanceof SessionStateError) {
+        await this.pauseAccountForLogin(browserAccount.id, error.message, {
+          failureType: mapSessionFailureType(error.sessionState),
+          triggerStage: "topic_discovery"
+        });
+        blockedAccountIds.add(browserAccount.id);
+        blockedMessages.push(error.message);
+        accountsById.set(browserAccount.id, {
+          ...browserAccount,
+          status: "manual_login_required",
+          statusReason: error.message
+        });
+        return assigned;
+      }
+
+      console.error("[worker] topic discovery failed", error);
+      return assigned;
+    }
+
+    holders = await this.topicRepository.listOpenCandidateHolders(accountIds);
+    assigned += await this.applyTopicAssignments(holders, demand);
+    return assigned;
+  }
+
+  private async listTopicDemand(accounts: WorkerAccount[], blockedAccountIds: Set<number>) {
+    const jobs = await this.jobRepository.getJobsNeedingPreparation(PREPARE_CANDIDATE_FETCH_LIMIT, {
       now: new Date(),
       withinMinutes: PREPARE_WINDOW_MINUTES
     });
-    logDebugTiming("worker.prepareQueuedJobs", "loaded_jobs", {
-      elapsedMs: getElapsedMs(startedAt),
-      jobs: jobs.map((job) => ({ id: job.id, accountId: job.accountId, status: job.status, scheduledAt: job.scheduledAt }))
-    });
-    let preparedJobs = 0;
-
+    const demand = new Map<number, number>();
     for (const job of jobs) {
-      const account = accountsById.get(job.accountId);
-      if (!account) {
+      if (blockedAccountIds.has(job.accountId)) {
         continue;
       }
-
-      if (blockedAccountIds.has(job.accountId) || blockedRiskDomains.has(account.riskDomain)) {
-        blockedAccountIds.add(job.accountId);
-        if (blockedRiskDomains.has(account.riskDomain)) {
-          blockedMessages.push(buildRiskDomainBlockedMessage(account));
-        }
-        continue;
-      }
-
-      if (isLoginBlockedAccount(account) || isCoolingDown(account)) {
-        blockedAccountIds.add(job.accountId);
-        blockedRiskDomains.add(account.riskDomain);
-        blockedMessages.push(resolveAccountBlockMessage(account));
-        continue;
-      }
-
-      const result = await this.prepareJob(job, account);
-      if (result.prepared) {
-        preparedJobs += 1;
-      }
-      if (result.blockedByLogin) {
-        blockedAccountIds.add(job.accountId);
-        blockedRiskDomains.add(account.riskDomain);
-        blockedMessages.push(result.message ?? `账号 #${job.accountId} 需要人工登录恢复。`);
-        accountsById.set(job.accountId, {
-          ...account,
-          status: "manual_login_required",
-          statusReason: result.message
-        });
-      }
+      demand.set(job.accountId, (demand.get(job.accountId) ?? 0) + 1);
     }
 
-    logDebugTiming("worker.prepareQueuedJobs", "done", {
-      preparedJobs,
-      elapsedMs: getElapsedMs(startedAt)
+    return accounts
+      .filter((account) => (demand.get(account.id) ?? 0) > 0)
+      .map((account) => ({
+        accountId: account.id,
+        neededCount: demand.get(account.id) ?? 0
+      }));
+  }
+
+  private async applyTopicAssignments(
+    holders: Array<{ id: number; accountId: number }>,
+    demand: Array<{ accountId: number; neededCount: number }>
+  ) {
+    const assignments = planTopicAssignments({ candidates: holders, demand });
+    let moved = 0;
+    for (const assignment of assignments) {
+      const ok = await this.topicRepository.reassignOpenCandidateAccount(assignment.candidateId, assignment.toAccountId);
+      if (ok) {
+        moved += 1;
+      }
+    }
+    if (moved > 0) {
+      console.warn("[worker] distributed shared topic batch", {
+        moved,
+        assignments: assignments.map((item) => ({
+          candidateId: item.candidateId,
+          fromAccountId: item.fromAccountId,
+          toAccountId: item.toAccountId
+        }))
+      });
+    }
+    return moved;
+  }
+
+  private async kickPrepareQueuedJobs(
+    accountsById: Map<number, WorkerAccount>,
+    blockedAccountIds: Set<number>,
+    emptyPoolAccountIds = new Set<number>()
+  ): Promise<{ preparedJobs: number; inFlightPrepareJobs: number }> {
+    const startedAt = Date.now();
+    const availableSlots = Math.max(0, MAX_PREPARE_CONCURRENCY - this.inFlightPrepareJobs.size);
+    if (availableSlots <= 0) {
+      return {
+        preparedJobs: 0,
+        inFlightPrepareJobs: this.inFlightPrepareJobs.size
+      };
+    }
+
+    const jobs = await this.jobRepository.getJobsNeedingPreparation(PREPARE_CANDIDATE_FETCH_LIMIT, {
+      now: new Date(),
+      withinMinutes: PREPARE_WINDOW_MINUTES
+    });
+    const selected = selectAccountScopedPrepareJobs({
+      jobs,
+      accountsById,
+      blockedAccountIds,
+      inFlightJobIds: new Set(this.inFlightPrepareJobs.keys()),
+      inFlightAccountIds: new Set([...this.inFlightPrepareJobs.values()].map((entry) => entry.accountId)),
+      skipAccountIds: emptyPoolAccountIds,
+      limit: availableSlots
     });
 
-    return { preparedJobs };
+    logDebugTiming("worker.kickPrepareQueuedJobs", "selected_jobs", {
+      elapsedMs: getElapsedMs(startedAt),
+      availableSlots,
+      candidateJobs: jobs.map((job) => ({ id: job.id, accountId: job.accountId, status: job.status, scheduledAt: job.scheduledAt })),
+      selectedJobs: selected.map(({ job }) => ({ id: job.id, accountId: job.accountId, scheduledAt: job.scheduledAt }))
+    });
+
+    for (const { job, account } of selected) {
+      const promise = this.prepareJob(job, account)
+        .catch((error) => {
+          console.error("[worker] background prepare failed", {
+            jobId: job.id,
+            accountId: job.accountId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        })
+        .then(() => undefined);
+      this.inFlightPrepareJobs.set(job.id, { accountId: job.accountId, promise });
+      void promise.finally(() => {
+        this.inFlightPrepareJobs.delete(job.id);
+      });
+    }
+
+    return {
+      preparedJobs: selected.length,
+      inFlightPrepareJobs: this.inFlightPrepareJobs.size
+    };
   }
 
   private async prepareJob(job: JobListItem, account: WorkerAccount): Promise<PrepareJobResult> {
@@ -531,15 +635,23 @@ export class WorkerRunner {
         error: error instanceof Error ? error.message : String(error)
       });
 
-      if (isLlmConnectionError(error)) {
-        console.error("[worker] LLM connection error during prepare, will retry next tick", {
+      if (isLlmConnectionError(error) || isRetryableLockError(error)) {
+        const message = error instanceof Error ? error.message : "准备稿件时发生可重试错误。";
+        console.error("[worker] retryable error during prepare, will retry next tick", {
           jobId: job.id,
-          error: error instanceof Error ? error.message : String(error)
+          error: message
+        });
+        await this.jobRepository.updateJobStatus(job.id, "queued", {
+          currentStage: "queued",
+          failureReason: isRetryableLockError(error)
+            ? "数据库锁冲突，等待下一轮自动重试。"
+            : "LLM 连接失败，等待下一轮自动重试。",
+          lastErrorType: null
         });
         return {
           prepared: false,
           blockedByLogin: false,
-          message: error instanceof Error ? error.message : "LLM 连接失败，等待下一轮自动重试。"
+          message
         };
       }
 
@@ -561,7 +673,6 @@ export class WorkerRunner {
     dueJobs: JobListItem[],
     accountsById: Map<number, WorkerAccount>,
     blockedAccountIds: Set<number>,
-    blockedRiskDomains: Set<string>,
     blockedMessages: string[]
   ): Promise<{ processedJobs: number }> {
     const startedAt = Date.now();
@@ -587,15 +698,8 @@ export class WorkerRunner {
         continue;
       }
 
-      if (blockedRiskDomains.has(account.riskDomain)) {
-        blockedAccountIds.add(job.accountId);
-        blockedMessages.push(buildRiskDomainBlockedMessage(account));
-        continue;
-      }
-
       if (isLoginBlockedAccount(account) || isCoolingDown(account)) {
         blockedAccountIds.add(job.accountId);
-        blockedRiskDomains.add(account.riskDomain);
         blockedMessages.push(resolveAccountBlockMessage(account));
         continue;
       }
@@ -612,7 +716,6 @@ export class WorkerRunner {
 
       if (result.blockedByLogin) {
         blockedAccountIds.add(job.accountId);
-        blockedRiskDomains.add(account.riskDomain);
         blockedMessages.push(result.message ?? `账号 #${job.accountId} 需要人工登录恢复。`);
         accountsById.set(job.accountId, {
           ...account,
@@ -697,6 +800,7 @@ export class WorkerRunner {
     let rewriteCount = 0;
     const sessionKey = `publish-account-${job.accountId}-job-${job.id}`;
     const baseTraceGroupId = `job-${job.id}-${Date.now()}`;
+    let keepBrowserOpenForChallenge = false;
 
     await this.jobRepository.updateJobStatus(job.id, "publishing", {
       currentStage: "login_checking",
@@ -709,7 +813,8 @@ export class WorkerRunner {
       await this.scheduleRepository.updateSlotStatus(slot.id, "in_progress");
     }
 
-    while (true) {
+    try {
+      while (true) {
       const attemptNo = retryCount + 1;
       const traceGroupId = `${baseTraceGroupId}-attempt-${attemptNo}`;
       const attemptPayload = {
@@ -754,7 +859,10 @@ export class WorkerRunner {
             accountName: account.name
           }),
           PUBLISH_ATTEMPT_TIMEOUT_MS,
-          `发布步骤超时（>${Math.round(PUBLISH_ATTEMPT_TIMEOUT_MS / 1000)}s），已中断并重试。`
+          `发布步骤超时（>${Math.round(PUBLISH_ATTEMPT_TIMEOUT_MS / 1000)}s），已中断并重试。`,
+          async () => {
+            await this.publishService.closeSession(sessionKey);
+          }
         );
 
         await this.finalizePublishedJob({
@@ -846,8 +954,9 @@ export class WorkerRunner {
             resumeAnchorJson,
             failureType: keepChallengePageOpen ? "challenge_required" : failure.failureType
           });
-          if (!keepChallengePageOpen) {
-            await this.publishService.closeSession(sessionKey);
+          if (keepChallengePageOpen) {
+            keepBrowserOpenForChallenge = true;
+            this.publishService.scheduleSessionClose(sessionKey, CHALLENGE_PAGE_KEEP_OPEN_MS);
           }
 
           return {
@@ -1102,6 +1211,11 @@ export class WorkerRunner {
         );
         await this.publishService.closeSession(sessionKey);
         return { blockedByLogin: false, message: null };
+      }
+    }
+    } finally {
+      if (!keepBrowserOpenForChallenge) {
+        await this.publishService.closeSession(sessionKey);
       }
     }
   }
@@ -1522,9 +1636,31 @@ export class WorkerRunner {
     await this.feishuNotificationService.sendProblemNotification(fallbackInput);
   }
 
+  private async ensureAccountSoulDocument(account: WorkerAccount) {
+    const inheritFromAccountId = readWriterPromptSourceAccountId(account);
+    const ensureSoul = this.accountSoulService.ensureSoulDocument.bind(this.accountSoulService) as (
+      account: WorkerAccount,
+      inheritFromAccountId?: number | null
+    ) => ReturnType<AccountSoulService["ensureSoulDocument"]>;
+    return ensureSoul(account, inheritFromAccountId);
+  }
+
+  private async resolveWriterPromptVersionId(account?: Pick<WorkerAccount, "id" | "writerPromptVersionId"> | null) {
+    if (!account) {
+      return null;
+    }
+    const repository = this.accountRepository as AccountRepository & {
+      resolveEffectiveWriterPromptVersionId?: (accountId: number) => Promise<number | null>;
+    };
+    if (typeof repository.resolveEffectiveWriterPromptVersionId === "function") {
+      return repository.resolveEffectiveWriterPromptVersionId(account.id);
+    }
+    return account.writerPromptVersionId ?? null;
+  }
+
   private async ensurePromptSnapshot(
     job: Pick<JobListItem, "id" | "status" | "currentStage" | "promptVersionSnapshotJson">,
-    account?: Pick<WorkerAccount, "writerPromptVersionId">
+    account?: Pick<WorkerAccount, "id" | "writerPromptVersionId"> | null
   ) {
     if (job.promptVersionSnapshotJson) {
       return {
@@ -1534,7 +1670,7 @@ export class WorkerRunner {
     }
 
     const promptSnapshot = await this.llmService.getPromptSnapshotForAccount({
-      writerPromptVersionId: account?.writerPromptVersionId ?? null
+      writerPromptVersionId: await this.resolveWriterPromptVersionId(account)
     });
     const promptSnapshotJson = JSON.stringify(promptSnapshot);
 
@@ -1551,7 +1687,7 @@ export class WorkerRunner {
 
   private async ensureSoulSnapshot(
     job: Pick<JobListItem, "id" | "status" | "currentStage" | "soulVersion" | "soulMarkdownSnapshot">,
-    account: Pick<WorkerAccount, "id" | "name" | "zhihuUserName">
+    account: WorkerAccount
   ) {
     if (job.soulMarkdownSnapshot) {
       return {
@@ -1560,7 +1696,7 @@ export class WorkerRunner {
       };
     }
 
-    const soulDocument = await this.accountSoulService.ensureSoulDocument(account);
+    const soulDocument = await this.ensureAccountSoulDocument(account);
     await this.jobRepository.updateJobStatus(job.id, job.status, {
       currentStage: job.currentStage ?? job.status,
       soulVersion: soulDocument.version,
@@ -1617,10 +1753,6 @@ export class WorkerRunner {
 
     return this.jobRepository.getJobById(jobId);
   }
-}
-
-function addMinutes(date: Date, minutes: number) {
-  return new Date(date.getTime() + minutes * 60 * 1000);
 }
 
 function resolveJobContent(jobDetail: Pick<JobDetail, "approvedContent" | "humanizedContent" | "draftContent">) {
@@ -1717,7 +1849,7 @@ function buildManualRecoveryMessage(message: string, keepChallengePageOpen: bool
     return message;
   }
 
-  return `${message} 当前发布页已保留，不会自动关闭。请直接在这个浏览器页面里完成人机验证、滑块或其他反爬挑战，处理完后再点“登录成功，继续下一步”。`;
+  return `${message} 当前发布页已保留最多 15 分钟。请直接在这个浏览器页面里完成人机验证、滑块或其他反爬挑战，处理完后再点“登录成功，继续下一步”。超时后浏览器会强制关闭，避免占用内存。`;
 }
 
 function isChallengeSignalText(value: string) {
@@ -1753,7 +1885,10 @@ function isLlmConnectionError(error: unknown): boolean {
     msg.includes("socket hang up") ||
     msg.includes("llm did not return") ||
     msg.includes("llm stream idle") ||
-    msg.includes("llm returned an empty stream")
+    msg.includes("llm returned an empty stream") ||
+    msg.includes("stream was interrupted") ||
+    msg.includes("stream_read_error") ||
+    msg.includes("upstream_stream_read_error")
   );
 }
 
@@ -1848,17 +1983,97 @@ function toAccountPromptContext(account: WorkerAccount): AccountPromptContext {
   };
 }
 
+function readWriterPromptSourceAccountId(account: object): number | null {
+  const value = (account as { writerPromptSourceAccountId?: number | null }).writerPromptSourceAccountId;
+  return typeof value === "number" ? value : null;
+}
+
 function isLoginBlockedAccount(account: Pick<WorkerAccount, "status">) {
   return account.status === "manual_login_required" || account.status === "session_expired";
 }
 
-function isCoolingDown(account: Pick<WorkerAccount, "cooldownUntil">) {
+function isCoolingDown(account: Pick<WorkerAccount, "cooldownUntil"> | { cooldownUntil?: string | Date | null }) {
   if (!account.cooldownUntil) {
     return false;
   }
 
   const timestamp = new Date(account.cooldownUntil).valueOf();
   return Number.isFinite(timestamp) && timestamp > Date.now();
+}
+
+export function shouldHarvestAccountPool(input: {
+  activeCandidateCount: number;
+  hasInFlightPrepare?: boolean;
+  hasImminentJobs?: boolean;
+}) {
+  return input.activeCandidateCount <= 0;
+}
+
+function countHoldersByAccount(holders: Array<{ accountId: number }>) {
+  const counts = new Map<number, number>();
+  for (const holder of holders) {
+    counts.set(holder.accountId, (counts.get(holder.accountId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function pickHarvestBrowserAccount<
+  TAccount extends { id: number; profileDir?: string | null }
+>(
+  accounts: TAccount[],
+  blockedAccountIds: Set<number>,
+  demand: Array<{ accountId: number; neededCount: number }>
+) {
+  const demandIds = new Set(demand.map((item) => item.accountId));
+  return (
+    accounts.find((account) => demandIds.has(account.id) && !blockedAccountIds.has(account.id) && account.profileDir) ??
+    accounts.find((account) => !blockedAccountIds.has(account.id) && account.profileDir) ??
+    null
+  );
+}
+
+export function selectAccountScopedPrepareJobs<
+  TJob extends { id: number; accountId: number },
+  TAccount extends { id: number; status: string; cooldownUntil?: string | Date | null }
+>(input: {
+  jobs: TJob[];
+  accountsById: Map<number, TAccount>;
+  blockedAccountIds: Set<number>;
+  inFlightJobIds: Set<number>;
+  inFlightAccountIds: Set<number>;
+  skipAccountIds?: Set<number>;
+  limit: number;
+}): Array<{ job: TJob; account: TAccount }> {
+  const selected: Array<{ job: TJob; account: TAccount }> = [];
+  const usedAccounts = new Set(input.inFlightAccountIds);
+
+  for (const job of input.jobs) {
+    if (selected.length >= input.limit) {
+      break;
+    }
+    if (
+      input.inFlightJobIds.has(job.id) ||
+      input.blockedAccountIds.has(job.accountId) ||
+      input.skipAccountIds?.has(job.accountId)
+    ) {
+      continue;
+    }
+
+    const account = input.accountsById.get(job.accountId);
+    if (!account || isLoginBlockedAccount(account) || isCoolingDown(account)) {
+      continue;
+    }
+    if (usedAccounts.has(job.accountId)) {
+      continue;
+    }
+
+    selected.push({ job, account });
+    if (selected.filter((item) => item.job.accountId === job.accountId).length >= MAX_PREPARE_JOBS_PER_ACCOUNT) {
+      usedAccounts.add(job.accountId);
+    }
+  }
+
+  return selected;
 }
 
 function resolveAccountBlockMessage(
@@ -1878,10 +2093,6 @@ function resolveAccountBlockMessage(
       ? `账号「${account.name}」正在等待人工登录完成。`
       : `账号「${account.name}」需要先恢复登录态。`)
   );
-}
-
-function buildRiskDomainBlockedMessage(account: Pick<WorkerAccount, "name" | "riskDomain">) {
-  return `账号「${account.name}」所在风险域「${account.riskDomain}」已有账号触发登录异常或冷却，本轮自动调度跳过。`;
 }
 
 function resolveTickAccountStatus(totalAccounts: number, blockedAccounts: number) {
@@ -1975,24 +2186,6 @@ function buildFailureDiagnosticNote(message: string) {
 
 async function wait(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withTimeoutReject<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | null = null;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error(message));
-        }, timeoutMs);
-      })
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
 }
 
 /**

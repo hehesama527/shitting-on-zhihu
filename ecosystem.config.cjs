@@ -24,8 +24,29 @@ function createApp(name, args) {
   };
 }
 
+function createScriptApp(name, scriptRelativePath) {
+  return {
+    name,
+    cwd: rootDir,
+    script: path.join(rootDir, scriptRelativePath),
+    interpreter: "bash",
+    exec_mode: "fork",
+    autorestart: true,
+    restart_delay: 3000,
+    kill_timeout: 10000,
+    env: {
+      NODE_ENV: "production"
+    },
+    out_file: path.join(logDir, `${name}.out.log`),
+    error_file: path.join(logDir, `${name}.err.log`),
+    merge_logs: true,
+    time: true
+  };
+}
+
 module.exports = {
   apps: [
+    createScriptApp("laya-service", "scripts/start-laya-service.sh"),
     createApp("zhihu-api", "run start -w @zhihu-mvp/api"),
     createApp("control-api", "run start -w @zhihu-mvp/control-api"),
     createApp("hotspot-api", "run start -w @zhihu-mvp/hotspot-api"),

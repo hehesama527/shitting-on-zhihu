@@ -3,7 +3,7 @@
  * 用于诊断 Connection error 问题
  */
 
-import { chromium } from "playwright";
+import { launch, launchPersistentContext } from "cloakbrowser";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
@@ -38,9 +38,9 @@ async function testPlaywrightConnection() {
   
   try {
     console.log("启动浏览器...");
-    browser = await chromium.launch({
+    browser = await launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+      args: ["--no-sandbox"]
     });
     
     console.log("创建页面...");
@@ -93,11 +93,10 @@ async function testWithProfile() {
     console.log(`Profile 目录：${profileDir}`);
     console.log("启动浏览器 (带 profile)...");
     
-    browser = await chromium.launchPersistentContext(profileDir, {
-      channel: "msedge",
+    browser = await launchPersistentContext({
+      userDataDir: profileDir,
       headless: false,
       viewport: null,
-      args: ["--start-maximized", "--disable-blink-features=AutomationControlled"]
     });
     
     const page = browser.pages()[0] ?? (await browser.newPage());

@@ -31,6 +31,11 @@ import {
   TopicRepository,
   TopicReviewService,
   WorkerRunner,
+  VideoAgentService,
+  VideoCaseService,
+  VideoRepository,
+  VideoService,
+  VideoWorkerRunner,
   ZhihuNoteAgentService,
   applySchemaMigrations,
   getAppConfig,
@@ -39,9 +44,15 @@ import {
 } from "@zhihu-mvp/core";
 import {
   accountRecoveryActionSchema,
+  createVideoProjectSchema,
+  createVideoCaseIntentSchema,
+  createVideoTopicBatchSchema,
   createAccountSchema,
   createJobSchema,
   createPromptDraftSchema,
+  refillVideoTopicBatchSchema,
+  generateVideoScriptSchema,
+  generateVideoCaseReviewSchema,
   type FailureType,
   promptSetNameSchema,
   promptTestRunSchema,
@@ -49,8 +60,13 @@ import {
   rescheduleJobSchema,
   retryJobSchema,
   saveAccountSoulSchema,
+  saveVideoScriptPackSchema,
+  saveVideoTopicFeedbackSchema,
+  saveVisualRenderPlanSchema,
   updateAccountSchema,
   updatePromptDraftSchema,
+  videoFeedbackDocumentInputSchema,
+  videoHotspotScoreSchema,
   zhihuNoteAgentApplySchema,
   zhihuNoteAgentGenerateSchema
 } from "@zhihu-mvp/shared";
@@ -87,6 +103,11 @@ const sessionService = new SessionService(browserSkillService, llmService);
 const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService);
 const publishService = new PublishService(llmService, browserSkillService, sessionService);
 const feishuNotificationService = new FeishuNotificationService();
+const videoRepository = new VideoRepository(pool);
+const videoAgentService = new VideoAgentService(llmService);
+const videoService = new VideoService(videoRepository, videoAgentService, feishuNotificationService);
+const videoCaseService = new VideoCaseService(videoRepository);
+const videoWorkerRunner = new VideoWorkerRunner(videoRepository, videoService, videoAgentService);
 const failureResolutionService = new FailureResolutionService(llmService);
 const opsIncidentRepository = new OpsIncidentRepository(pool);
 const opsDiagnosisService = new OpsDiagnosisService();
@@ -889,8 +910,187 @@ app.post("/prompt-versions/:id/rollback-target", async (request) => {
   return { ok: true };
 });
 
+app.get("/video-hub/summary", async () => ({
+  summary: await videoService.getHubSummary()
+}));
+
+app.get("/video-hub/topic-batches", async () => ({
+  batches: await videoRepository.listTopicBatches()
+}));
+
+app.post("/video-hub/topic-batches", async (request) => {
+  const body = createVideoTopicBatchSchema.parse(request.body ?? {});
+  return {
+    batch: await videoService.createTopicBatch(body)
+  };
+});
+
+app.post("/video-hub/topic-batches/:id/refill", async (request) => {
+  const params = request.params as { id: string };
+  const body = refillVideoTopicBatchSchema.parse(request.body ?? {});
+  return {
+    batch: await videoService.refillTopicBatch(params.id, body)
+  };
+});
+
+app.get("/video-hub/topic-candidates", async (request) => {
+  const query = request.query as { batchId?: string; limit?: string };
+  return {
+    candidates: await videoRepository.listTopicCandidates(Number(query.limit ?? 50), query.batchId ?? null)
+  };
+});
+
+app.post("/video-hub/hotspots/score", async (request) => {
+  const body = videoHotspotScoreSchema.parse(request.body ?? {});
+  return {
+    result: await videoService.scoreHotspot(body)
+  };
+});
+
+app.post("/video-hub/topic-candidates/:id/feedback", async (request) => {
+  const params = request.params as { id: string };
+  const body = saveVideoTopicFeedbackSchema.parse(request.body ?? {});
+  return {
+    candidate: await videoService.saveTopicFeedback(params.id, body)
+  };
+});
+
+app.get("/video-hub/projects", async () => ({
+  projects: await videoRepository.listProjects()
+}));
+
+app.post("/video-hub/projects", async (request) => {
+  const body = createVideoProjectSchema.parse(request.body ?? {});
+  return {
+    project: await videoService.createProject(body.topicCandidateId, body.title ?? null)
+  };
+});
+
+app.get("/video-hub/projects/:id", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoRepository.getProjectDetail(params.id)
+  };
+});
+
+app.get("/video-hub/projects/:id/case-intents", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    caseIntents: await videoCaseService.listCaseIntents(params.id)
+  };
+});
+
+app.post("/video-hub/projects/:id/case-intents", async (request) => {
+  const params = request.params as { id: string };
+  const body = createVideoCaseIntentSchema.parse(request.body ?? {});
+  return {
+    caseIntent: await videoCaseService.createCaseIntent(params.id, body)
+  };
+});
+
+app.get("/video-hub/projects/:id/case-packs", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    casePacks: await videoCaseService.listVerifiedCasePacks(params.id)
+  };
+});
+
+app.post("/video-hub/projects/:id/case-review/generate", async (request) => {
+  const params = request.params as { id: string };
+  const body = generateVideoCaseReviewSchema.parse(request.body ?? {});
+  return {
+    casePack: await videoCaseService.generateVerifiedCasePack(params.id, body.caseIntentId ?? null)
+  };
+});
+
+app.post("/video-hub/projects/:id/script/generate", async (request) => {
+  const params = request.params as { id: string };
+  const body = generateVideoScriptSchema.parse(request.body ?? {});
+  return {
+    project: await videoService.generateScript(params.id, body.revisionInstruction, body.verifiedCasePackId ?? null)
+  };
+});
+
+app.put("/video-hub/projects/:id/script", async (request) => {
+  const params = request.params as { id: string };
+  const body = saveVideoScriptPackSchema.parse(request.body ?? {});
+  return {
+    project: await videoService.saveScript(params.id, body.scriptPack)
+  };
+});
+
+app.post("/video-hub/projects/:id/script/confirm", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoService.confirmScript(params.id)
+  };
+});
+
+app.post("/video-hub/projects/:id/render-plan/generate", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoService.generateVisualPlan(params.id)
+  };
+});
+
+app.put("/video-hub/projects/:id/render-plan", async (request) => {
+  const params = request.params as { id: string };
+  const body = saveVisualRenderPlanSchema.parse(request.body ?? {});
+  return {
+    project: await videoService.saveVisualPlan(params.id, body.visualRenderPlan)
+  };
+});
+
+app.post("/video-hub/projects/:id/render-plan/confirm", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoService.confirmVisualPlan(params.id)
+  };
+});
+
+app.post("/video-hub/projects/:id/assets/enqueue", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoService.enqueueAssets(params.id)
+  };
+});
+
+app.post("/video-hub/projects/:id/compose", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoService.enqueueComposition(params.id)
+  };
+});
+
+app.post("/video-hub/projects/:id/approve", async (request) => {
+  const params = request.params as { id: string };
+  return {
+    project: await videoService.approveProject(params.id)
+  };
+});
+
+app.post("/video-hub/feedback-documents", async (request) => {
+  const body = videoFeedbackDocumentInputSchema.parse(request.body ?? {});
+  return {
+    document: await videoService.createFeedbackDocument(body)
+  };
+});
+
+app.get("/video-hub/assets/:id/content", async (request, reply) => {
+  const params = request.params as { id: string };
+  const asset = await videoRepository.getAsset(params.id);
+  if (!asset?.filePath) {
+    const error = new Error("Video asset file not found.") as Error & { statusCode?: number };
+    error.statusCode = 404;
+    throw error;
+  }
+  const content = await fs.readFile(asset.filePath);
+  return reply.type(asset.mimeType ?? "application/octet-stream").send(content);
+});
+
 app.post("/worker/tick", async () => ({
-  summary: await workerRunner.tick()
+  summary: await workerRunner.tick(),
+  videoSummary: await videoWorkerRunner.tick()
 }));
 
 await app.listen({
