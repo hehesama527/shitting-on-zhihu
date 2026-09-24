@@ -818,6 +818,15 @@ export class WorkerRunner {
       console.warn("[worker] skipped job because another worker owns its lease", { jobId: job.id, accountId: job.accountId });
       return { blockedByLogin: false, message: "任务已被其他 Worker 领取。" };
     }
+    const leaseRenewTimer = setInterval(() => {
+      void this.jobRepository.renewJobLease(job.id, leaseOwner).then((ok) => {
+        if (!ok) {
+          console.warn("[worker] publish lease renewal failed", { jobId: job.id });
+        }
+      }).catch((error) => {
+        console.warn("[worker] publish lease renewal error", { jobId: job.id, error: error instanceof Error ? error.message : String(error) });
+      });
+    }, 5 * 60_000);
 
     await this.jobRepository.updateJobStatus(job.id, "publishing", {
       currentStage: "login_checking",
@@ -896,7 +905,8 @@ export class WorkerRunner {
             pageSnapshot: publishResult.pageSnapshot
           },
           publishStage: "publish_verify",
-          artifactPhase: "publish-success"
+          artifactPhase: "publish-success",
+          leaseOwner
         });
 
         await this.publishService.closeSession(sessionKey);
@@ -937,7 +947,8 @@ export class WorkerRunner {
           promptSnapshotJson: promptContext.promptSnapshotJson,
           traceGroupId,
           expectedZhihuUserName: account.zhihuUserName,
-          accountName: account.name
+          accountName: account.name,
+          leaseOwner
         });
         if (recoveredAsPublished) {
           await this.publishService.closeSession(sessionKey);
@@ -1010,7 +1021,8 @@ export class WorkerRunner {
                 finishedAt: new Date().toISOString()
               },
               publishStage: "publish_verify",
-              artifactPhase: "publish-verify"
+              artifactPhase: "publish-verify",
+              leaseOwner
             });
 
             await this.publishService.closeSession(sessionKey);
@@ -1231,6 +1243,7 @@ export class WorkerRunner {
       }
     }
     } finally {
+      clearInterval(leaseRenewTimer);
       if (!keepBrowserOpenForChallenge) {
         await this.publishService.closeSession(sessionKey);
       }
@@ -1418,6 +1431,7 @@ export class WorkerRunner {
     traceGroupId: string;
     expectedZhihuUserName: string | null;
     accountName: string;
+    leaseOwner: string;
   }) {
     const verificationUrl = pickVerificationUrl(input.jobDetail, input.failure);
     if (!verificationUrl) {
@@ -1458,7 +1472,8 @@ export class WorkerRunner {
           verifyResult
         },
         publishStage: "publish_verify",
-        artifactPhase: "publish-verify"
+        artifactPhase: "publish-verify",
+        leaseOwner: input.leaseOwner
       });
 
       return true;
@@ -1478,19 +1493,18 @@ export class WorkerRunner {
     attemptPayload: Record<string, unknown>;
     publishStage?: string | null;
     artifactPhase?: string;
+    leaseOwner: string;
   }) {
-    await this.jobRepository.updatePublishAttempt(input.attemptId, {
-      status: "published",
-      currentUrl: input.finalUrl,
-      payload: input.attemptPayload,
-      failureType: null,
-      failureReason: null
+    const finalized = await this.jobRepository.finalizePublishedAtomically({
+      jobId: input.job.id,
+      attemptId: input.attemptId,
+      leaseOwner: input.leaseOwner,
+      finalUrl: input.finalUrl,
+      attemptPayload: input.attemptPayload
     });
-
-    await this.jobRepository.cleanupRunningAttemptsForJob(input.job.id, {
-      exceptAttemptId: input.attemptId,
-      reason: `Closed stale running attempts after publish attempt #${input.attemptId} succeeded.`
-    });
+    if (!finalized) {
+      throw new Error(`任务 #${input.job.id} 已被其他执行者完成或接管，拒绝重复收口。`);
+    }
 
     if (input.screenshotPath) {
       await this.jobRepository.createArtifact(input.attemptId, "screenshot", input.screenshotPath, {
@@ -1498,21 +1512,20 @@ export class WorkerRunner {
       });
     }
 
-    await this.jobRepository.updateJobStatus(input.job.id, "published", {
-      finalUrl: input.finalUrl,
-      failureReason: null,
-      currentStage: "published",
-      resumeAnchorJson: null,
-      lastErrorType: null,
-      promptVersionSnapshotJson: input.promptSnapshotJson
-    });
-
     if (input.slotId) {
-      await this.scheduleRepository.updateSlotStatus(input.slotId, "published");
+      try {
+        await this.scheduleRepository.updateSlotStatus(input.slotId, "published");
+      } catch (error) {
+        console.error("[worker] published job finalized but schedule slot update failed", { jobId: input.job.id, slotId: input.slotId, error });
+      }
     }
 
     if (input.jobDetail.topicCardId) {
-      await this.topicRepository.markCandidatePublishedByTopicCard(input.jobDetail.topicCardId);
+      try {
+        await this.topicRepository.markCandidatePublishedByTopicCard(input.jobDetail.topicCardId);
+      } catch (error) {
+        console.error("[worker] published job finalized but candidate status update failed", { jobId: input.job.id, error });
+      }
     }
 
     if (input.jobDetail.questionUrl && input.jobDetail.questionTitle) {
@@ -1532,19 +1545,27 @@ export class WorkerRunner {
       }
     }
 
-    await this.accountRepository.touchPublishSuccess(input.job.accountId);
+    try {
+      await this.accountRepository.touchPublishSuccess(input.job.accountId);
+    } catch (error) {
+      console.error("[worker] published job finalized but account publish timestamp update failed", { jobId: input.job.id, error });
+    }
 
-    const account = await this.accountRepository.getAccount(input.job.accountId);
-    await this.feishuNotificationService.sendPublishSuccessNotification({
-      accountName: account?.name ?? `账号#${input.job.accountId}`,
-      zhihuUserName: account?.zhihuUserName ?? null,
-      jobId: input.job.id,
-      publishStage: input.publishStage ?? "publish_verify",
-      questionTitle: input.jobDetail.questionTitle ?? input.jobDetail.title ?? input.job.title,
-      publishedAt: new Date(),
-      scheduledAt: input.jobDetail.scheduledAt ?? input.job.scheduledAt,
-      finalUrl: input.finalUrl
-    });
+    try {
+      const account = await this.accountRepository.getAccount(input.job.accountId);
+      await this.feishuNotificationService.sendPublishSuccessNotification({
+        accountName: account?.name ?? `账号#${input.job.accountId}`,
+        zhihuUserName: account?.zhihuUserName ?? null,
+        jobId: input.job.id,
+        publishStage: input.publishStage ?? "publish_verify",
+        questionTitle: input.jobDetail.questionTitle ?? input.jobDetail.title ?? input.job.title,
+        publishedAt: new Date(),
+        scheduledAt: input.jobDetail.scheduledAt ?? input.job.scheduledAt,
+        finalUrl: input.finalUrl
+      });
+    } catch (error) {
+      console.error("[worker] published job finalized but success notification failed", { jobId: input.job.id, error });
+    }
   }
 
   private async pauseAccountForLogin(
@@ -1971,7 +1992,7 @@ function pickVerificationUrl(
     storedResumeAnchor?.currentUrl ?? null
   ];
 
-  return candidates.find((url): url is string => Boolean(url && url.includes("/answer/"))) ?? null;
+  return candidates.find((url): url is string => Boolean(url && /^https?:\/\//i.test(url))) ?? null;
 }
 
 function logExecutionContext(input: {

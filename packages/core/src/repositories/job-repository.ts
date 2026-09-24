@@ -250,8 +250,7 @@ export class JobRepository {
            current_stage = 'review_passed',
            resume_anchor_json = NULL,
            last_error_type = NULL
-       WHERE id = ?
-         AND (status NOT IN ('published', 'failed_terminal') OR status = ?)`,
+       WHERE id = ?`,
       [input.topicCardId, input.reviewId, input.title, input.promptVersionSnapshotJson, jobId]
     );
   }
@@ -358,6 +357,49 @@ export class JobRepository {
       `UPDATE publish_jobs SET lease_owner = NULL, lease_until = NULL WHERE id = ? AND lease_owner = ?`,
       [jobId, owner]
     );
+  }
+
+  async finalizePublishedAtomically(input: {
+    jobId: number;
+    attemptId: number;
+    leaseOwner: string;
+    finalUrl: string;
+    attemptPayload: unknown;
+    failureReason?: string | null;
+  }) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [jobResult] = await connection.query<ResultSetHeader>(
+        `UPDATE publish_jobs
+         SET status = 'published', final_url = ?, failure_reason = NULL,
+             current_stage = 'published', resume_anchor_json = NULL,
+             last_error_type = NULL, finished_at = CURRENT_TIMESTAMP,
+             lease_owner = NULL, lease_until = NULL
+         WHERE id = ? AND lease_owner = ?
+           AND status NOT IN ('published', 'failed_terminal')`,
+        [input.finalUrl, input.jobId, input.leaseOwner]
+      );
+      if (jobResult.affectedRows !== 1) {
+        await connection.rollback();
+        return false;
+      }
+      await connection.query(
+        `UPDATE publish_attempts SET status = 'published', current_url = ?, attempt_json = ?, failure_type = NULL, failure_reason = NULL WHERE id = ?`,
+        [input.finalUrl, JSON.stringify(input.attemptPayload), input.attemptId]
+      );
+      await connection.query(
+        `UPDATE publish_attempts SET status = 'failed', failure_reason = COALESCE(failure_reason, 'Superseded by a successful publish attempt.') WHERE publish_job_id = ? AND id <> ? AND status = 'running'`,
+        [input.jobId, input.attemptId]
+      );
+      await connection.commit();
+      return true;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async updateJobRuntimeContext(
