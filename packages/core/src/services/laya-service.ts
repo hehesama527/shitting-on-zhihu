@@ -59,6 +59,36 @@ export type LayaPublishFailureClassification = {
   reason: string;
 };
 
+export type LayaTopicClassification = {
+  relevant: boolean;
+  topicType: string;
+  valueLevel: "high" | "medium" | "low";
+  riskLevel: "high" | "medium" | "low";
+  duplicateRisk: "high" | "medium" | "low";
+  confidence: "high" | "medium" | "low";
+  reason?: string;
+};
+
+export type LayaDraftPrecheck = {
+  decision: "PASS" | "REVIEW" | "BLOCK";
+  riskFlags: Array<{ type: string; text: string; reason: string }>;
+  formatIssues: string[];
+  duplicateSignals: string[];
+  confidence: "high" | "medium" | "low";
+};
+
+export type LayaHumanizerMark = {
+  segments: Array<{ start: number; end: number; issue: string; suggestion: string }>;
+  confidence: "high" | "medium" | "low";
+};
+
+export type LayaRetryDecision = {
+  action: "retry" | "refresh" | "reopen" | "manual_login" | "stop";
+  waitMs: number;
+  reason: string;
+  confidence: "high" | "medium" | "low";
+};
+
 export class LayaService {
   private readonly baseUrl: string;
   private readonly enabled: boolean;
@@ -234,5 +264,36 @@ export class LayaService {
       logDebugTiming("laya.classifyPublishFailure", "fallback", { elapsedMs: Date.now() - start, error: String(err) });
       return null;
     }
+  }
+
+  private async post<T>(path: string, input: unknown, timeoutMs = 1500): Promise<T | null> {
+    if (!this.enabled) return null;
+    try {
+      const res = await fetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      return res.ok ? ((await res.json()) as T) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async classifyTopic(input: { title: string; url?: string; sourceType?: string; historyMatched?: boolean }): Promise<LayaTopicClassification | null> {
+    return this.post<LayaTopicClassification>("/api/classify-topic", input, 1200);
+  }
+
+  async precheckDraft(input: { title?: string; content: string; topicSummary?: string }): Promise<LayaDraftPrecheck | null> {
+    return this.post<LayaDraftPrecheck>("/api/precheck-draft", input, 1800);
+  }
+
+  async markHumanizer(input: { content: string }): Promise<LayaHumanizerMark | null> {
+    return this.post<LayaHumanizerMark>("/api/humanizer-mark", input, 1800);
+  }
+
+  async decideRetry(input: { failureType: string; retryCount: number; stage?: string; context?: unknown }): Promise<LayaRetryDecision | null> {
+    return this.post<LayaRetryDecision>("/api/retry-decision", input, 1200);
   }
 }

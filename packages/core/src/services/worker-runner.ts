@@ -527,7 +527,7 @@ export class WorkerRunner {
 
   private async prepareJob(job: JobListItem, account: WorkerAccount): Promise<PrepareJobResult> {
     const leaseOwner = `prepare-${process.pid}-${randomUUID()}`;
-    if (!(await this.jobRepository.claimJob(job.id, leaseOwner))) {
+    if (!(await this.jobRepository.claimJob(job.id, leaseOwner, "prepare"))) {
       return { prepared: false, blockedByLogin: false, message: "任务已被其他 Worker 准备。" };
     }
     try {
@@ -813,7 +813,7 @@ export class WorkerRunner {
     const baseTraceGroupId = `job-${job.id}-${Date.now()}`;
     let keepBrowserOpenForChallenge = false;
     const leaseOwner = `worker-${process.pid}-${randomUUID()}`;
-    const claimed = await this.jobRepository.claimJob(job.id, leaseOwner);
+    const claimed = await this.jobRepository.claimJob(job.id, leaseOwner, "publish");
     if (!claimed) {
       console.warn("[worker] skipped job because another worker owns its lease", { jobId: job.id, accountId: job.accountId });
       return { blockedByLogin: false, message: "任务已被其他 Worker 领取。" };
@@ -1499,6 +1499,12 @@ export class WorkerRunner {
       jobId: input.job.id,
       attemptId: input.attemptId,
       leaseOwner: input.leaseOwner,
+      accountId: input.job.accountId,
+      slotId: input.slotId,
+      topicCardId: input.jobDetail.topicCardId ?? null,
+      reviewId: input.jobDetail.reviewId ?? null,
+      questionUrl: input.jobDetail.questionUrl ?? "",
+      questionTitle: input.jobDetail.questionTitle ?? input.jobDetail.title ?? input.job.title ?? `任务 #${input.job.id}`,
       finalUrl: input.finalUrl,
       attemptPayload: input.attemptPayload
     });
@@ -1507,9 +1513,13 @@ export class WorkerRunner {
     }
 
     if (input.screenshotPath) {
-      await this.jobRepository.createArtifact(input.attemptId, "screenshot", input.screenshotPath, {
-        phase: input.artifactPhase ?? "publish-verify"
-      });
+      try {
+        await this.jobRepository.createArtifact(input.attemptId, "screenshot", input.screenshotPath, {
+          phase: input.artifactPhase ?? "publish-verify"
+        });
+      } catch (error) {
+        console.error("[worker] published job finalized but screenshot artifact persistence failed", { jobId: input.job.id, error });
+      }
     }
 
     if (input.slotId) {

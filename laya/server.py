@@ -75,6 +75,52 @@ class PublishFailureResponse(BaseModel):
     confidence: str
     reason: str
 
+class TopicClassificationInput(BaseModel):
+    title: str = ""
+    url: str = ""
+    sourceType: str = ""
+    historyMatched: bool = False
+
+class TopicClassificationResponse(BaseModel):
+    relevant: bool
+    topicType: str
+    valueLevel: str
+    riskLevel: str
+    duplicateRisk: str
+    confidence: str
+    reason: str = ""
+
+class DraftPrecheckInput(BaseModel):
+    title: str = ""
+    content: str = ""
+    topicSummary: str = ""
+
+class DraftPrecheckResponse(BaseModel):
+    decision: str
+    riskFlags: List[Dict[str, str]] = []
+    formatIssues: List[str] = []
+    duplicateSignals: List[str] = []
+    confidence: str
+
+class HumanizerMarkInput(BaseModel):
+    content: str = ""
+
+class HumanizerMarkResponse(BaseModel):
+    segments: List[Dict[str, Any]] = []
+    confidence: str
+
+class RetryDecisionInput(BaseModel):
+    failureType: str = ""
+    retryCount: int = 0
+    stage: str = ""
+    context: Dict[str, Any] = {}
+
+class RetryDecisionResponse(BaseModel):
+    action: str
+    waitMs: int
+    reason: str
+    confidence: str
+
 @app.on_event("startup")
 def startup_event():
     global AGENT
@@ -374,6 +420,51 @@ def classify_publish_failure(data: PublishFailureInput):
     score = answer.get("confidence", 0.5)
     confidence = "high" if score >= 0.7 else ("medium" if score >= 0.4 else "low")
     return PublishFailureResponse(failureType=failure_type, confidence=confidence, reason=f"Laya异常分类：{failure_type}")
+
+@app.post("/api/classify-topic", response_model=TopicClassificationResponse)
+def classify_topic(data: TopicClassificationInput):
+    title = data.title.strip()
+    if not title:
+        return TopicClassificationResponse(relevant=False, topicType="unknown", valueLevel="low", riskLevel="high", duplicateRisk="low", confidence="high", reason="标题为空")
+    risk_terms = ["违法", "赌博", "色情", "破解", "刷量", "代写"]
+    if any(term in title for term in risk_terms):
+        return TopicClassificationResponse(relevant=False, topicType="risk", valueLevel="low", riskLevel="high", duplicateRisk="low", confidence="high", reason="标题命中高风险词")
+    if data.historyMatched:
+        return TopicClassificationResponse(relevant=False, topicType="duplicate", valueLevel="low", riskLevel="low", duplicateRisk="high", confidence="high", reason="候选题已有历史匹配")
+    topic_type = "tooling" if any(term in title.lower() for term in ["api", "模型", "claude", "gpt", "编程", "开发", "工具"]) else "general"
+    return TopicClassificationResponse(relevant=True, topicType=topic_type, valueLevel="medium", riskLevel="low", duplicateRisk="low", confidence="medium", reason="未命中明显风险，进入主流程复核")
+
+@app.post("/api/precheck-draft", response_model=DraftPrecheckResponse)
+def precheck_draft(data: DraftPrecheckInput):
+    content = data.content.strip()
+    if not content:
+        return DraftPrecheckResponse(decision="BLOCK", formatIssues=["正文为空"], confidence="high")
+    risk_terms = ["保证100%", "稳赚", "绝对有效", "官方内部", "绕过限制"]
+    flags = [{"type": "风险承诺", "text": term, "reason": "命中绝对化或规避限制表达"} for term in risk_terms if term in content]
+    issues = ["正文过短"] if len(content) < 120 else []
+    decision = "BLOCK" if flags else ("REVIEW" if issues else "PASS")
+    return DraftPrecheckResponse(decision=decision, riskFlags=flags, formatIssues=issues, confidence="high" if flags else "medium")
+
+@app.post("/api/humanizer-mark", response_model=HumanizerMarkResponse)
+def humanizer_mark(data: HumanizerMarkInput):
+    segments = []
+    for phrase in ["首先，", "其次，", "最后，", "综上所述，", "值得注意的是，"]:
+        start = data.content.find(phrase)
+        if start >= 0:
+            segments.append({"start": start, "end": start + len(phrase), "issue": "模板化连接词", "suggestion": "结合具体经历或上下文改写"})
+    return HumanizerMarkResponse(segments=segments[:8], confidence="medium" if segments else "high")
+
+@app.post("/api/retry-decision", response_model=RetryDecisionResponse)
+def retry_decision(data: RetryDecisionInput):
+    if data.failureType in ["LOGIN_REQUIRED", "CAPTCHA_REQUIRED", "RISK_CONTROL", "challenge_required"]:
+        return RetryDecisionResponse(action="manual_login", waitMs=0, reason="需要人工处理登录或风控挑战", confidence="high")
+    if data.failureType in ["NETWORK_TIMEOUT", "network_or_page_error"]:
+        if data.retryCount == 0:
+            return RetryDecisionResponse(action="refresh", waitMs=1800, reason="网络或页面异常，先刷新后重试", confidence="high")
+        return RetryDecisionResponse(action="stop", waitMs=0, reason="网络异常已重试，停止自动操作", confidence="medium")
+    if data.retryCount < 2:
+        return RetryDecisionResponse(action="retry", waitMs=1000 + data.retryCount * 800, reason="可恢复错误，有限次数重试", confidence="medium")
+    return RetryDecisionResponse(action="stop", waitMs=0, reason="超过自动重试上限", confidence="high")
 
 if __name__ == "__main__":
     import uvicorn

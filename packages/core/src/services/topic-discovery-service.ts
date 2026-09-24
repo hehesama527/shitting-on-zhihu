@@ -14,6 +14,7 @@ import { LlmService } from "./llm-service.js";
 import { SessionService } from "./session-service.js";
 import { TopicBatchPlannerService } from "./topic-batch-planner-service.js";
 import { ZhihuAgentContextService } from "./zhihu-agent-context-service.js";
+import { LayaService } from "./laya-service.js";
 
 const TOPIC_BATCH_SIZE = 10;
 const TOPIC_WIDE_POOL_SIZE = 30;
@@ -88,14 +89,17 @@ type TopicAgentPrefilterBatchOutput = {
 export class TopicDiscoveryService {
   private readonly agentContextService = new ZhihuAgentContextService();
   private readonly topicBatchPlannerService: TopicBatchPlannerService;
+  private readonly layaService: LayaService;
 
   constructor(
     private readonly topicRepository: TopicRepository,
     private readonly browserSkillService: BrowserSkillService,
     private readonly sessionService: SessionService,
-    private readonly llmService: LlmService
+    private readonly llmService: LlmService,
+    layaService?: LayaService
   ) {
     this.topicBatchPlannerService = new TopicBatchPlannerService(llmService, topicRepository);
+    this.layaService = layaService ?? new LayaService();
   }
 
   async harvestCandidates(input: {
@@ -264,6 +268,17 @@ export class TopicDiscoveryService {
       const validity = this.checkCandidateByTitle(link.text, questionUrl);
       await this.topicRepository.markCandidateValidity(candidate.id, validity.status, validity.reason);
       if (validity.status !== "valid") {
+        continue;
+      }
+
+      const layaTopic = await this.layaService.classifyTopic({
+        title: link.text,
+        url: questionUrl,
+        sourceType,
+        historyMatched: false
+      });
+      if (layaTopic?.confidence === "high" && (!layaTopic.relevant || layaTopic.riskLevel === "high" || layaTopic.duplicateRisk === "high")) {
+        await this.topicRepository.markCandidateBlocked(candidate.id, `Laya 初筛：${layaTopic.reason ?? "不进入候选池"}`);
         continue;
       }
 

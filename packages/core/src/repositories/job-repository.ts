@@ -13,6 +13,7 @@ import type {
   ToolTraceSummary
 } from "@zhihu-mvp/shared";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { hashZhihuQuestionUrl, normalizeZhihuQuestionUrl } from "../utils/zhihu-url.js";
 
 type JobRow = RowDataPacket & {
   id: number;
@@ -316,27 +317,22 @@ export class JobRepository {
     );
   }
 
-  async claimJob(jobId: number, owner: string, leaseMinutes = 15, transitionStatus: JobStatus | null = "publishing") {
+  async claimJob(jobId: number, owner: string, phase: "prepare" | "publish", leaseMinutes = 15) {
     const leaseUntil = new Date(Date.now() + leaseMinutes * 60_000);
+    const statuses = phase === "prepare"
+      ? ["queued", "topic_discovery", "topic_agent", "topic_review", "writer", "humanizing", "review_hard_gate", "review_editorial", "review_publish"]
+      : ["review_passed", "login_checking", "publishing", "publish_verify", "retry_waiting"];
+    const placeholders = statuses.map(() => "?").join(", ");
     const [result] = await this.pool.query<ResultSetHeader>(
       `UPDATE publish_jobs
        SET lease_owner = ?,
            lease_until = ?,
-           status = CASE WHEN ? IS NULL THEN status ELSE ? END,
-           current_stage = CASE WHEN ? IS NULL THEN current_stage ELSE ? END
+           status = CASE WHEN ? = 'publish' THEN 'publishing' ELSE status END,
+           current_stage = CASE WHEN ? = 'publish' THEN 'login_checking' ELSE current_stage END
        WHERE id = ?
-         AND status NOT IN ('published', 'failed_terminal', 'needs_manual_review')
-         AND (lease_until IS NULL OR lease_until < NOW() OR lease_owner = ?)` ,
-      [
-        owner,
-        leaseUntil,
-        transitionStatus,
-        transitionStatus,
-        transitionStatus,
-        transitionStatus ? "login_checking" : null,
-        jobId,
-        owner
-      ]
+         AND status IN (${placeholders})
+         AND (lease_until IS NULL OR lease_until < NOW())`,
+      [owner, leaseUntil, phase, phase, jobId, ...statuses]
     );
     return result.affectedRows === 1;
   }
@@ -363,10 +359,22 @@ export class JobRepository {
     jobId: number;
     attemptId: number;
     leaseOwner: string;
+    accountId: number;
+    slotId: number | null;
+    topicCardId: number | null;
+    reviewId: number | null;
+    questionUrl: string;
+    questionTitle: string;
     finalUrl: string;
     attemptPayload: unknown;
-    failureReason?: string | null;
+    screenshotPath?: string | null;
+    artifactPhase?: string;
   }) {
+    const questionUrl = normalizeZhihuQuestionUrl(input.questionUrl);
+    const questionUrlHash = hashZhihuQuestionUrl(questionUrl);
+    if (!questionUrl || !questionUrlHash) {
+      throw new Error(`Cannot finalize job #${input.jobId}: invalid question URL.`);
+    }
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -376,9 +384,9 @@ export class JobRepository {
              current_stage = 'published', resume_anchor_json = NULL,
              last_error_type = NULL, finished_at = CURRENT_TIMESTAMP,
              lease_owner = NULL, lease_until = NULL
-         WHERE id = ? AND lease_owner = ?
+         WHERE id = ? AND account_id = ? AND lease_owner = ? AND lease_until >= NOW()
            AND status NOT IN ('published', 'failed_terminal')`,
-        [input.finalUrl, input.jobId, input.leaseOwner]
+        [input.finalUrl, input.jobId, input.accountId, input.leaseOwner]
       );
       if (jobResult.affectedRows !== 1) {
         await connection.rollback();
@@ -391,6 +399,39 @@ export class JobRepository {
       await connection.query(
         `UPDATE publish_attempts SET status = 'failed', failure_reason = COALESCE(failure_reason, 'Superseded by a successful publish attempt.') WHERE publish_job_id = ? AND id <> ? AND status = 'running'`,
         [input.jobId, input.attemptId]
+      );
+      if (input.screenshotPath) {
+        await connection.query(
+          `INSERT INTO artifacts (publish_attempt_id, artifact_type, file_path, meta_json) VALUES (?, 'screenshot', ?, ?)`,
+          [input.attemptId, input.screenshotPath, JSON.stringify({ phase: input.artifactPhase ?? "publish-verify" })]
+        );
+      }
+      if (input.slotId != null) {
+        await connection.query(
+          `UPDATE daily_publish_schedule SET status = 'published' WHERE id = ? AND publish_job_id = ?`,
+          [input.slotId, input.jobId]
+        );
+      }
+      if (input.topicCardId != null) {
+        await connection.query(
+          `UPDATE topic_candidates tc JOIN topic_cards card ON card.topic_candidate_id = tc.id SET tc.status = 'published' WHERE card.id = ?`,
+          [input.topicCardId]
+        );
+      }
+      await connection.query(
+        `INSERT INTO answered_topics
+         (account_id, question_url_hash, question_url, question_title, topic_card_id, review_id, publish_job_id, answer_url, answered_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON DUPLICATE KEY UPDATE question_url = VALUES(question_url), question_title = VALUES(question_title),
+           topic_card_id = VALUES(topic_card_id), review_id = VALUES(review_id),
+           publish_job_id = VALUES(publish_job_id), answer_url = VALUES(answer_url),
+           answered_at = GREATEST(answered_at, VALUES(answered_at))`,
+        [input.accountId, questionUrlHash, questionUrl, input.questionTitle, input.topicCardId, input.reviewId, input.jobId, input.finalUrl]
+      );
+      await connection.query(
+        `UPDATE accounts SET status = 'active', status_reason = NULL, cooldown_until = NULL,
+         last_publish_at = CURRENT_TIMESTAMP, last_login_check_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [input.accountId]
       );
       await connection.commit();
       return true;

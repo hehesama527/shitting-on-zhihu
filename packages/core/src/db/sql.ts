@@ -733,11 +733,6 @@ const columnMigrations: ColumnMigration[] = [
 ];
 
 const rawMigrations = [
-  `DELETE a1 FROM answered_topics a1
-   INNER JOIN answered_topics a2
-     ON a1.question_url_hash = a2.question_url_hash
-    AND COALESCE(a1.account_id, 0) = COALESCE(a2.account_id, 0)
-    AND a1.id > a2.id`,
   "UPDATE accounts SET risk_domain = 'default' WHERE risk_domain IS NULL OR TRIM(risk_domain) = ''",
   "ALTER TABLE publish_jobs MODIFY COLUMN topic_card_id INT NULL",
   "ALTER TABLE publish_jobs MODIFY COLUMN review_id INT NULL",
