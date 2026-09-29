@@ -5,6 +5,8 @@ coverage
 data
 data-x
 .env
+.env.*
+!.env.example
 .env.local
 npm-debug.log*
 tsconfig.tsbuildinfo
@@ -20,3 +22,14 @@ tmp-*.json
 *.log
 tmp-*
 data-x-traditional/
+__pycache__/
+*.pyc
+.tmp-*
+.tmp-*/
+/*.tar.gz
+/WLAN*.xml
+/scratch/
+/social-auto-upload/
+/CloakBrowser/
+/*.png
+/*.sql

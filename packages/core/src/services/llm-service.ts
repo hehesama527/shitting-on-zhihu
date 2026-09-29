@@ -1,5 +1,5 @@
 import type { PromptSetName, PromptSnapshotMap } from "@zhihu-mvp/shared";
-import { createOpenAiClient, readLlmRuntimeConfig } from "../config/llm-provider.js";
+import { createOpenAiClient, readLlmRuntimeConfig, resolveLlmQuotaFallbacks } from "../config/llm-provider.js";
 import { getDefaultPromptSeed } from "../prompts/default-prompts.js";
 import { PromptRepository } from "../repositories/prompt-repository.js";
 import { getElapsedMs, logDebugTiming } from "../utils/debug-timing.js";
@@ -153,7 +153,8 @@ export class LlmService {
         }
       ],
       {
-        initialResponseTimeoutMs: timeoutMs
+        initialResponseTimeoutMs: timeoutMs,
+        quotaFallbacks: resolveLlmQuotaFallbacks(runtimeTarget)
       }
     );
 
@@ -169,7 +170,8 @@ export class LlmService {
     systemPrompt: string,
     input: unknown,
     fallback: T,
-    timeoutMs = DEFAULT_LLM_REQUEST_TIMEOUT_MS
+    timeoutMs = DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+    runtimeTarget: PromptSetName | "zhihu" = "zhihu"
   ) {
     const startedAt = Date.now();
     logDebugTiming("llm.runJsonWithSystemPrompt", "start", {
@@ -181,7 +183,8 @@ export class LlmService {
         systemPrompt,
         input,
         timeoutMs,
-        "custom system prompt returned empty response text."
+        "custom system prompt returned empty response text.",
+        runtimeTarget
       );
       logDebugTiming("llm.runJsonWithSystemPrompt", "done", {
         timeoutMs,

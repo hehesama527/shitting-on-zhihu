@@ -1,6 +1,26 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+function Get-MysqlRootPassword {
+    if ($env:MYSQL_ROOT_PASSWORD) {
+        return $env:MYSQL_ROOT_PASSWORD
+    }
+
+    $envFile = Join-Path $PSScriptRoot ".env"
+    if (Test-Path $envFile) {
+        foreach ($line in Get-Content $envFile) {
+            if ($line -match '^MYSQL_URL=mysql://[^:]+:([^@]+)@') {
+                return $Matches[1]
+            }
+        }
+    }
+
+    Write-Host "  -> Set MYSQL_ROOT_PASSWORD or MYSQL_URL in .env before starting MySQL." -ForegroundColor Red
+    exit 1
+}
+
+$mysqlRootPassword = Get-MysqlRootPassword
+
 Write-Host "=====================================" -ForegroundColor Cyan
 Write-Host "Claw services startup" -ForegroundColor Cyan
 Write-Host "=====================================" -ForegroundColor Cyan
@@ -24,7 +44,7 @@ if ($mysqlContainer) {
     docker run -d `
         --name mysql-zhihu `
         -p 6306:3306 `
-        -e MYSQL_ROOT_PASSWORD=680327 `
+        -e MYSQL_ROOT_PASSWORD=$mysqlRootPassword `
         -e MYSQL_DATABASE=zhihu_mvp `
         -v mysql-zhihu-data:/var/lib/mysql `
         mysql:8.0 | Out-Null
@@ -44,7 +64,7 @@ Start-Sleep -Seconds 5
 $mysqlReady = $false
 for ($i = 1; $i -le 10; $i++) {
     try {
-        mysql -h 127.0.0.1 -P 6306 -u root -p680327 -e "SELECT 1" 2>$null | Out-Null
+        mysql -h 127.0.0.1 -P 6306 -u root -p"$mysqlRootPassword" -e "SELECT 1" 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) {
             $mysqlReady = $true
             break

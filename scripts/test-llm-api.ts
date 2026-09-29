@@ -1,6 +1,9 @@
 // 快速 LLM API 测试
 async function testLLM() {
-  const apiKey = 'sk-sp-e762d60c6f6f452e88c153b104d6378d';
+  const apiKey = process.env.X_AGENT_API_KEY;
+  if (!apiKey) {
+    throw new Error("请设置环境变量 X_AGENT_API_KEY");
+  }
   const apiUrl = 'https://coding.dashscope.aliyuncs.com/v1/chat/completions';
 
   console.log('正在测试 LLM API...\n');

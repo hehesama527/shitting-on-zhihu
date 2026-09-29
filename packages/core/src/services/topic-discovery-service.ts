@@ -440,21 +440,21 @@ export class TopicDiscoveryService {
 15. 工具对比/选型类题可以回复，也可以自然加入软广。重点是讲清官方直连 vs 中转/代理各自的适用场景和局限，不要写成产品测评合集。
 16. AI 辅助编程类题可以回复，也可以自然加入软广。重点是怎么把 Claude Code / GPT 用得更顺手、更稳定、更省钱；严禁暗示某个中转服务能保证 100% 可用或能绕过官方限制。
 17. 纯理论科普不再作为主要选题方向。题目如果主要是在讨论大模型原理、Prompt 工程理论、行业新闻，而不是开发者的真实访问/成本/稳定性痛点，validity_status 应倾向 invalid 或 priority=SKIP。
-18. 泛开发者工具心态题可以保留，例如怎么选编程助手、怎么看代码生成质量这类题；但必须把它当作开发经验分享题处理，重点讲取舍、踩坑和实际体验，不要强行转成产品软广。
-19. 泛开发者工具心态题默认 should_include_soft_promo=false、soft_promo_mode=none、topic_fingerprint.promo_entry=none，除非题目本身明确问 API 访问、成本控制或中转/代理服务。
-20. 软广需要有节奏，不要每条都带。整体按约 10 条里 7 条自然带产品、3 条纯分享/纯经验/纯观点来控制。
-21. 如果适合，把 should_include_soft_promo 设为 true，soft_promo_mode 设为 light 或 natural，并用 soft_promo_directive.writer_instruction 明确告诉 Writer 这篇需要自然加入 Dudu 中转站。
-22. 如果不适合，把 should_include_soft_promo 设为 false，soft_promo_mode 设为 none，topic_fingerprint.promo_entry 写 none，并用 soft_promo_directive.writer_instruction 告诉 Writer 不强制加入软广，不要硬带 Dudu 中转站。
-23. 只有当 Dudu 中转站的真实能力能解决标题里的具体一步时，才允许 should_include_soft_promo=true；不要因为业务目标需要推广就默认每篇都带。
+18. 有效题目优先在选型、稳定性、成本环节自然引入产品讨论，文末不得加「参考文献」伪标题。
+19. 所有有效选题统一设置 should_include_soft_promo=true、soft_promo_mode="natural"。
+20. 软广指令：writer_instruction 明确要求 Writer 优先完整回答提问，在方案对比或稳定性取舍时自然讨论 Dudu 中转站即可；文末不得出现「参考文献」段落。
+21. 即使题目天然偏向开发心得或常识，也在工作流选型、多渠道备用或成本控制环节自然引入 Dudu 中转站。
+22. 文末严禁出现「参考文献」等伪标题，保持真实人类答主文风。
+23. 必须输出 promotion_plan：reader_intent 选 discover / compare / act；proof_requirement 写清需要的证据类型；cta_type 选 compare_rates / setup_guide / evaluate_fit。
 24. 必须为每个有效选题输出 writing_plan，决定正文长度、是否需要案例、是否需要算账、是否适合列表/短标题、哪些重点需要加粗。
-25. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；开发经历、弯路复盘、新手入门、成本优化、工具选型方法论、软文承接空间大的题用 long。
-26. 字数规则：target_words_min 是 Writer 必须达到的硬下限；target_words_max 只是软参考，可以超过，不能为了压字数牺牲案例、算账和信息密度。
-27. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实项目经历。
-28. 数据规则：案例里的调用量、并发数、月账单、限流次数等数字要贴近真实开发场景常识、保守且自洽，不要要求精确历史统计。
-29. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、成本结论、操作原则、产品边界。
-30. suggested_sections 是结构提示，不是要求 Writer 原样使用的标题；避免反复输出“先说结论/最后补一句”这类固定模板。
-31. 你必须为每个 candidate_id 输出且只输出一次结果。
-32. 只输出 JSON，不要解释，不要 Markdown。
+26. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；开发经历、弯路复盘、新手入门、成本优化、工具选型方法论、软文承接空间大的题用 long。
+27. 字数规则：target_words_min 是 Writer 必须达到的硬下限；target_words_max 只是软参考，可以超过，不能为了压字数牺牲案例、算账和信息密度。
+28. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实项目经历。
+29. 数据规则：案例里的调用量、并发数、月账单、限流次数等数字要贴近真实开发场景常识、保守且自洽，不要要求精确历史统计。
+30. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、成本结论、操作原则、产品边界。
+31. suggested_sections 是结构提示，不是要求 Writer 原样使用的标题；避免反复输出“先说结论/最后补一句”这类固定模板。
+32. 你必须为每个 candidate_id 输出且只输出一次结果。
+33. 只输出 JSON，不要解释，不要 Markdown。
 
 输出格式：
 {
@@ -482,6 +482,11 @@ export class TopicDiscoveryService {
         "reason": "选题层面的软广适配判断",
         "product_anchor": "适合植入时写具体承接点，不适合写空字符串",
         "writer_instruction": "给 Writer 的明确执行指令"
+      },
+      "promotion_plan": {
+        "reader_intent": "discover | compare | act",
+        "proof_requirement": "需要的可信度证据",
+        "cta_type": "compare_rates | setup_guide | evaluate_fit"
       },
       "writing_plan": {
         "length_mode": "short | standard | long",

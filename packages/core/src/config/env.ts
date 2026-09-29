@@ -89,7 +89,7 @@ export function getAppConfig(): AppConfig {
     codexAuthPath: process.env.CODEX_AUTH_PATH ?? path.join(codexHome, "auth.json"),
     humanizerSkillPath:
       process.env.HUMANIZER_SKILL_PATH ?? path.join(codexHome, "skills", "humanizer-zh", "SKILL.md"),
-    browserChannel: normalizeBrowserChannel(process.env.BROWSER_CHANNEL),
+    browserChannel: normalizeBrowserChannel(process.env.BROWSER_CHANNEL ?? process.env.X_BROWSER_CHANNEL),
     workerIntervalMs: Number(process.env.WORKER_INTERVAL_MS ?? 45_000),
     opsAgentIntervalMs: Number(process.env.OPS_AGENT_INTERVAL_MS ?? 60_000),
     // 2026-09 产品定位从 CryptoPathX 切换为 dudu 中转站。旧的 CryptoPathX 关键词默认值：

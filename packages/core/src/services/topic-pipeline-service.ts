@@ -13,12 +13,14 @@ import {
   joinPromptSuffixes
 } from "./account-prompt-context.js";
 import { HumanizerService } from "./humanizer-service.js";
+import { AntiAigcInspectorService } from "./anti-aigc-inspector-service.js";
 import { LlmService } from "./llm-service.js";
-import { ReviewService } from "./review-service.js";
+import { ReviewService, stripForcedReferences } from "./review-service.js";
 import { TopicBatchPlannerService } from "./topic-batch-planner-service.js";
 import { TopicReviewService } from "./topic-review-service.js";
 import { type ZhihuAgentContextDocuments, ZhihuAgentContextService } from "./zhihu-agent-context-service.js";
 import { type ZhihuCaseResearchOutput, ZhihuCaseResearchService } from "./zhihu-case-research-service.js";
+import { LayaService } from "./laya-service.js";
 
 type PreparedDraftResult =
   | {
@@ -60,6 +62,7 @@ type TopicAgentOutput = {
     product_anchor: string;
     writer_instruction: string;
   };
+  promotion_plan: PromotionPlan;
   writing_plan: TopicWritingPlan;
   must_avoid: string[];
   risk_notes: string[];
@@ -70,6 +73,12 @@ type TopicAgentOutput = {
     promo_entry: string;
   };
   case_research?: ZhihuCaseResearchOutput;
+};
+
+type PromotionPlan = {
+  reader_intent: "discover" | "compare" | "act";
+  proof_requirement: string;
+  cta_type: "compare_rates" | "setup_guide" | "evaluate_fit";
 };
 
 export type TopicWritingPlan = {
@@ -92,9 +101,19 @@ export type WriterAccountContext = AccountPromptContext;
 const MAX_REWRITE_ATTEMPTS = 5;
 const MAX_DRAFT_REVIEW_ATTEMPTS = MAX_REWRITE_ATTEMPTS + 1;
 
+function keepHumanizedContent(source: string, humanized: string) {
+  const next = humanized.trim();
+  if (source.length >= 800 && next.length < Math.min(400, source.length * 0.3)) {
+    return stripForcedReferences(source);
+  }
+  return stripForcedReferences(next || source);
+}
+
 export class TopicPipelineService {
   private readonly agentContextService = new ZhihuAgentContextService();
   private readonly caseResearchService: ZhihuCaseResearchService;
+  private readonly layaService: LayaService;
+  private readonly antiAigcInspector = new AntiAigcInspectorService();
 
   constructor(
     private readonly llmService: LlmService,
@@ -102,9 +121,11 @@ export class TopicPipelineService {
     private readonly topicBatchPlannerService: TopicBatchPlannerService,
     private readonly topicReviewService: TopicReviewService,
     private readonly reviewService: ReviewService,
-    private readonly humanizerService: HumanizerService
+    private readonly humanizerService: HumanizerService,
+    layaService?: LayaService
   ) {
     this.caseResearchService = new ZhihuCaseResearchService(this.llmService);
+    this.layaService = layaService ?? new LayaService();
   }
 
   async prepareNextPublishableDraft(input?: {
@@ -286,16 +307,6 @@ export class TopicPipelineService {
       );
 
       if (!preparedDraft || preparedDraft.kind === "blocked") {
-        if (preparedDraft?.kind === "blocked" && preparedDraft.needsManualReview && input?.publishJobId) {
-          logDebugTiming("topicPipeline.prepareNextPublishableDraft", "candidate_needs_manual_review", {
-            publishJobId: input.publishJobId,
-            candidateId: candidate.id,
-            reason: preparedDraft.reason,
-            elapsedMs: getElapsedMs(candidateStartedAt)
-          });
-          return preparedDraft;
-        }
-
         await this.topicRepository.markCandidateBlocked(
           candidate.id,
           preparedDraft?.kind === "blocked" ? preparedDraft.reason : "draft blocked before publish"
@@ -411,6 +422,7 @@ export class TopicPipelineService {
     });
     const maxAttempts = Math.max(1, Math.min(input.maxAttempts ?? MAX_DRAFT_REVIEW_ATTEMPTS, MAX_DRAFT_REVIEW_ATTEMPTS));
 
+    let writerContent = "";
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const attemptStartedAt = Date.now();
       logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_start", {
@@ -427,7 +439,11 @@ export class TopicPipelineService {
           questionUrl: input.questionUrl,
           topicCard,
           softPromoDirective: resolveSoftPromoDirective(topicCard),
-          revisionFeedback
+          revisionFeedback,
+          previousDraft: writerContent || undefined,
+          instruction: revisionFeedback
+            ? "请根据 revisionFeedback 对 previousDraft 进行针对性修改，保留原有优秀内容与口语化叙事，精准修正审核指出的问题，不要盲目推翻重写。"
+            : undefined
         },
         {
           title: input.candidateTitle,
@@ -459,8 +475,17 @@ export class TopicPipelineService {
         elapsedMs: getElapsedMs(attemptStartedAt)
       });
 
-      const writerContent =
+      writerContent =
         typeof writerOutput.content === "string" ? writerOutput.content.trim() : "";
+      const draftPrecheck = await this.layaService.precheckDraft({
+        title: typeof writerOutput.title === "string" ? writerOutput.title : input.candidateTitle,
+        content: writerContent,
+        topicSummary: topicCard.summary
+      });
+      if (draftPrecheck?.decision === "BLOCK" && draftPrecheck.confidence === "high") {
+        revisionFeedback = `Laya 预审发现风险：${draftPrecheck.riskFlags.map((item) => item.reason).join("；")}`;
+        continue;
+      }
       if (writerContent.length < 300) {
         await this.topicRepository.createDraft(
           input.topicCardId,
@@ -489,7 +514,7 @@ export class TopicPipelineService {
         continue;
       }
 
-      await this.topicRepository.createDraft(
+      const rawDraftId = await this.topicRepository.createDraft(
         input.topicCardId,
         "raw",
         writerContent,
@@ -500,34 +525,10 @@ export class TopicPipelineService {
         })
       );
 
-      await input.onStage?.("humanizing");
-      const humanized = await this.humanizerService.humanize(writerContent, {
-        publishJobId: input.publishJobId,
-        stage: "humanizing",
-        agentName: "writer_agent"
-      });
-      logDebugTiming("topicPipeline.generateReviewedDraft", "humanizer_done", {
-        publishJobId: input.publishJobId,
-        topicCardId: input.topicCardId,
-        attempt: attempt + 1,
-        elapsedMs: getElapsedMs(attemptStartedAt)
-      });
-
-      const humanizedDraftId = await this.topicRepository.createDraft(
-        input.topicCardId,
-        "humanized",
-        humanized.content,
-        writerOutput.summary ?? "",
-        JSON.stringify({
-          ...writerOutput,
-          topicCard,
-          humanizerNotes: humanized.notes
-        })
-      );
-
+      // 第一步：先由 Review Agent 进行审核（硬性卡点、切题、内容逻辑、排重等）
       const review = await this.reviewService.reviewContent(
         {
-          content: humanized.content,
+          content: writerContent,
           topicSummary: String(topicCard.summary ?? ""),
           topicCard,
           softPromoDirective: resolveSoftPromoDirective(topicCard),
@@ -550,9 +551,145 @@ export class TopicPipelineService {
         elapsedMs: getElapsedMs(attemptStartedAt)
       });
 
+      // 如果审核不通过，记录审核结果并快速失败/重写，避免在不合格草稿上浪费 Anti-AIGC 算力
+      if (review.decision !== "PASS") {
+        await this.topicRepository.createReview({
+          draftId: rawDraftId,
+          reviewStatus: review.decision.toLowerCase(),
+          hardGateJson: JSON.stringify(review.hardGate),
+          editorialReviewJson: JSON.stringify(review.editorial),
+          publishReviewJson: JSON.stringify(review.publish),
+          topicDuplicationJson: JSON.stringify(topicCard.topic_fingerprint ?? {}),
+          contentDuplicationJson: JSON.stringify({
+            duplicateReason: review.publish.duplicate_reason ?? "",
+            matchedPastContents: review.publish.matched_past_contents ?? []
+          }),
+          approvedContent: review.approvedContent,
+          reviewSummary: review.reviewSummary
+        });
+
+        if (review.decision === "BLOCK_DUPLICATION") {
+          logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_duplicate", {
+            publishJobId: input.publishJobId,
+            topicCardId: input.topicCardId,
+            attempt: attempt + 1,
+            elapsedMs: getElapsedMs(attemptStartedAt),
+            totalElapsedMs: getElapsedMs(startedAt)
+          });
+          return {
+            kind: "duplicate",
+            reason: review.publish.duplicate_reason ?? "content duplication detected during publish review"
+          };
+        }
+
+        if (review.decision === "BLOCK") {
+          logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_blocked", {
+            publishJobId: input.publishJobId,
+            topicCardId: input.topicCardId,
+            attempt: attempt + 1,
+            reason: review.reviewSummary || "content blocked by review",
+            elapsedMs: getElapsedMs(attemptStartedAt),
+            totalElapsedMs: getElapsedMs(startedAt)
+          });
+          return {
+            kind: "blocked",
+            reason: review.reviewSummary || "content blocked by review"
+          };
+        }
+
+        if (review.quality.manualReviewReasons.length > 0 && attempt >= 2) {
+          logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_needs_manual_review", {
+            publishJobId: input.publishJobId,
+            topicCardId: input.topicCardId,
+            attempt: attempt + 1,
+            reasons: review.quality.manualReviewReasons,
+            elapsedMs: getElapsedMs(attemptStartedAt),
+            totalElapsedMs: getElapsedMs(startedAt)
+          });
+          return {
+            kind: "blocked",
+            reason: buildManualReviewReason(review.quality.manualReviewReasons, review.reviewSummary),
+            needsManualReview: Boolean(input.publishJobId)
+          };
+        }
+
+        revisionFeedback = review.quality.rewriteBrief || review.editorial.rewrite_brief || review.reviewSummary;
+        logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_revise", {
+          publishJobId: input.publishJobId,
+          topicCardId: input.topicCardId,
+          attempt: attempt + 1,
+          elapsedMs: getElapsedMs(attemptStartedAt),
+          totalElapsedMs: getElapsedMs(startedAt)
+        });
+        continue;
+      }
+
+      // 第二步：审核通过后，进入 Anti-AIGC 双审查 + 润色阶段，消灭 AI 味
+      await input.onStage?.("humanizing");
+
+      let currentContent = stripForcedReferences(review.approvedContent || writerContent);
+      let auditResult = await this.antiAigcInspector.inspect(currentContent, {
+        publishJobId: input.publishJobId,
+        attempt: attempt + 1
+      });
+
+      let humanizerNotes: string[] = [];
+
+      // 若未通过质检（AI 概率高或突发性低），触发靶向处方精修
+      if (!auditResult.passed) {
+        logDebugTiming("topicPipeline.generateReviewedDraft", "aigc_audit_failed_refining", {
+          publishJobId: input.publishJobId,
+          topicCardId: input.topicCardId,
+          globalAiScore: auditResult.globalAiScore,
+          burstinessCv: auditResult.burstinessCv
+        });
+
+        const humanized = await this.humanizerService.humanize(currentContent, {
+          publishJobId: input.publishJobId,
+          stage: "humanizing",
+          agentName: "writer_agent",
+          extraSystemPrompt: auditResult.prescription
+        });
+
+        const refinedContent = keepHumanizedContent(currentContent, humanized.content);
+        humanizerNotes = humanized.notes;
+
+        // 复检重测，检验精修效果
+        const reAudit = await this.antiAigcInspector.inspect(refinedContent, {
+          publishJobId: input.publishJobId,
+          attempt: attempt + 1
+        });
+
+        currentContent = refinedContent;
+        auditResult = reAudit;
+      }
+
+      logDebugTiming("topicPipeline.generateReviewedDraft", "humanizer_done", {
+        publishJobId: input.publishJobId,
+        topicCardId: input.topicCardId,
+        attempt: attempt + 1,
+        finalAiScore: auditResult.globalAiScore,
+        finalBurstinessCv: auditResult.burstinessCv,
+        passed: auditResult.passed,
+        elapsedMs: getElapsedMs(attemptStartedAt)
+      });
+
+      const humanizedDraftId = await this.topicRepository.createDraft(
+        input.topicCardId,
+        "humanized",
+        currentContent,
+        writerOutput.summary ?? "",
+        JSON.stringify({
+          ...writerOutput,
+          topicCard,
+          humanizerNotes,
+          aigcAudit: auditResult
+        })
+      );
+
       const reviewId = await this.topicRepository.createReview({
         draftId: humanizedDraftId,
-        reviewStatus: review.decision.toLowerCase(),
+        reviewStatus: "pass",
         hardGateJson: JSON.stringify(review.hardGate),
         editorialReviewJson: JSON.stringify(review.editorial),
         publishReviewJson: JSON.stringify(review.publish),
@@ -561,81 +698,26 @@ export class TopicPipelineService {
           duplicateReason: review.publish.duplicate_reason ?? "",
           matchedPastContents: review.publish.matched_past_contents ?? []
         }),
-        approvedContent: review.approvedContent,
+        approvedContent: currentContent,
         reviewSummary: review.reviewSummary
       });
 
-      if (review.decision === "PASS" && review.approvedContent) {
-        logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_pass", {
-          publishJobId: input.publishJobId,
-          topicCardId: input.topicCardId,
-          attempt: attempt + 1,
-          elapsedMs: getElapsedMs(attemptStartedAt),
-          totalElapsedMs: getElapsedMs(startedAt)
-        });
-        return {
-          kind: "ready",
-          title: String(writerOutput.title ?? input.candidateTitle),
-          topicCardId: input.topicCardId,
-          reviewId,
-          approvedContent: review.approvedContent,
-          promptVersionSnapshotJson: JSON.stringify(promptSnapshot)
-        };
-      }
-
-      if (review.decision === "BLOCK_DUPLICATION") {
-        logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_duplicate", {
-          publishJobId: input.publishJobId,
-          topicCardId: input.topicCardId,
-          attempt: attempt + 1,
-          elapsedMs: getElapsedMs(attemptStartedAt),
-          totalElapsedMs: getElapsedMs(startedAt)
-        });
-        return {
-          kind: "duplicate",
-          reason: review.publish.duplicate_reason ?? "content duplication detected during publish review"
-        };
-      }
-
-      if (review.decision === "BLOCK") {
-        logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_blocked", {
-          publishJobId: input.publishJobId,
-          topicCardId: input.topicCardId,
-          attempt: attempt + 1,
-          reason: review.reviewSummary || "content blocked by review",
-          elapsedMs: getElapsedMs(attemptStartedAt),
-          totalElapsedMs: getElapsedMs(startedAt)
-        });
-        return {
-          kind: "blocked",
-          reason: review.reviewSummary || "content blocked by review"
-        };
-      }
-
-      if (review.quality.manualReviewReasons.length > 0 && attempt >= 2) {
-        logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_needs_manual_review", {
-          publishJobId: input.publishJobId,
-          topicCardId: input.topicCardId,
-          attempt: attempt + 1,
-          reasons: review.quality.manualReviewReasons,
-          elapsedMs: getElapsedMs(attemptStartedAt),
-          totalElapsedMs: getElapsedMs(startedAt)
-        });
-        return {
-          kind: "blocked",
-          reason: buildManualReviewReason(review.quality.manualReviewReasons, review.reviewSummary),
-          needsManualReview: Boolean(input.publishJobId)
-        };
-      }
-
-      revisionFeedback = review.quality.rewriteBrief || review.editorial.rewrite_brief || review.reviewSummary;
-      logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_revise", {
+      logDebugTiming("topicPipeline.generateReviewedDraft", "attempt_pass", {
         publishJobId: input.publishJobId,
         topicCardId: input.topicCardId,
         attempt: attempt + 1,
         elapsedMs: getElapsedMs(attemptStartedAt),
         totalElapsedMs: getElapsedMs(startedAt)
       });
+
+      return {
+        kind: "ready",
+        title: String(writerOutput.title ?? input.candidateTitle),
+        topicCardId: input.topicCardId,
+        reviewId,
+        approvedContent: currentContent,
+        promptVersionSnapshotJson: JSON.stringify(promptSnapshot)
+      };
     }
 
     logDebugTiming("topicPipeline.generateReviewedDraft", "rewrite_limit_reached", {
@@ -706,6 +788,11 @@ function buildTopicAgentFallback(questionTitle: string): TopicAgentOutput {
       reason: "选题兜底结果未确认软广契合点。",
       productAnchor: ""
     }),
+    promotion_plan: {
+      reader_intent: "discover",
+      proof_requirement: "问题场景和局限说明",
+      cta_type: "evaluate_fit"
+    },
     writing_plan: buildFallbackWritingPlan(),
     must_avoid: [],
     risk_notes: [],
@@ -720,6 +807,12 @@ function buildTopicAgentFallback(questionTitle: string): TopicAgentOutput {
 
 function normalizeCachedTopicAgentOutput(value: unknown, questionTitle: string): TopicAgentOutput | null {
   if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  // Reject cached prefilters that contain stale references or links
+  const serialized = JSON.stringify(value);
+  if (serialized.includes("router-list") || serialized.includes("参考文献")) {
     return null;
   }
 
@@ -762,6 +855,7 @@ function normalizeTopicAgentOutput(value: unknown, questionTitle: string): Topic
     reason: softPromoReason,
     productAnchor
   });
+  const promotionPlan = normalizePromotionPlan(record.promotion_plan, fallback.promotion_plan, shouldInclude);
 
   const normalized: TopicAgentOutput = {
     ...fallback,
@@ -781,6 +875,7 @@ function normalizeTopicAgentOutput(value: unknown, questionTitle: string): Topic
     soft_promo_reason: softPromoReason,
     should_include_soft_promo: shouldInclude,
     soft_promo_directive: softPromoDirective,
+    promotion_plan: promotionPlan,
     writing_plan: normalizeWritingPlan(record.writing_plan, fallback.writing_plan),
     must_avoid: normalizeStringArray(record.must_avoid),
     risk_notes: normalizeStringArray(record.risk_notes),
@@ -807,6 +902,13 @@ function normalizeTopicAgentOutput(value: unknown, questionTitle: string): Topic
       normalized.persona_hooks.join("\n")
     ].join("\n")
   );
+
+  if (normalized.soft_promo_directive?.writer_instruction) {
+    normalized.soft_promo_directive.writer_instruction = stripForcedReferences(normalized.soft_promo_directive.writer_instruction);
+  }
+  if (normalized.writing_plan?.writer_notes) {
+    normalized.writing_plan.writer_notes = stripForcedReferences(normalized.writing_plan.writer_notes);
+  }
 
   return normalized;
 }
@@ -995,6 +1097,26 @@ function normalizeSoftPromoMode(value: unknown, fallback: string) {
   return value === "light" || value === "natural" || value === "none" ? value : fallback;
 }
 
+function normalizePromotionPlan(value: unknown, fallback: PromotionPlan, shouldInclude: boolean): PromotionPlan {
+  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const readerIntent = record.reader_intent === "discover" || record.reader_intent === "compare" || record.reader_intent === "act"
+    ? record.reader_intent
+    : fallback.reader_intent;
+  const ctaType = record.cta_type === "compare_rates" || record.cta_type === "setup_guide" || record.cta_type === "evaluate_fit"
+    ? record.cta_type
+    : fallback.cta_type;
+  const proofRequirement =
+    typeof record.proof_requirement === "string" && record.proof_requirement.trim()
+      ? record.proof_requirement.trim()
+      : fallback.proof_requirement;
+
+  return {
+    reader_intent: shouldInclude ? readerIntent : "discover",
+    proof_requirement: proofRequirement,
+    cta_type: shouldInclude ? ctaType : "evaluate_fit"
+  };
+}
+
 function normalizeSoftPromoDirective(
   value: unknown,
   fallback: {
@@ -1087,24 +1209,23 @@ function buildTopicAgentSingleSelectionPromptSuffix() {
     "4. 工具对比/选型类题可以选，也可以加入软广。承接点是官方直连 vs 中转/代理的取舍、怎么判断中转服务是否可信，不要写成产品测评合集。",
     "5. AI 辅助编程类题可以选，也可以加入软广。承接点是怎么把 Claude Code / GPT 用得更顺手、更稳定、更省钱；严禁暗示某个中转服务能保证 100% 可用或能绕过官方限制。",
     "6. 不要把纯理论科普题（大模型原理、Prompt 工程理论、行业新闻）作为主要选题方向，除非能自然承接到访问/成本/稳定性的具体痛点。",
-    "7. 泛开发者工具心态题可以选，例如怎么选编程助手、怎么看代码生成质量这类题；但它们更适合作为纯经验分享，不要默认加入 Dudu 中转站。",
-    "8. 对泛开发者工具心态题，除非题目明确问 API 访问、成本控制或中转/代理服务，否则 should_include_soft_promo=false，soft_promo_mode=none，topic_fingerprint.promo_entry=none。",
-    "9. 软广需要有节奏，不要每一篇都带。整体按约 10 条里 7 条自然带产品、3 条纯分享/纯经验/纯观点来控制。",
-    "10. 即使题目能勉强接到产品，只要它更适合做人设信任、开发心得、踩坑经验或工具常识，就应优先留白：should_include_soft_promo=false。",
-    "11. 不要让纯理论题天然优先；如果访问/成本/稳定性/工具选型题更符合账号 Soul 和读者痛点，可以给更高 priority 和 fit_score。",
-    "12. 选题结束后，必须单独判断这个选题是否适合自然加入软广。",
-    "13. 如果适合，把 should_include_soft_promo 设为 true，soft_promo_mode 设为 light 或 natural，并在 soft_promo_directive.writer_instruction 里明确告诉 Writer：这篇需要自然加入 Dudu 中转站。",
-    "14. 如果不适合，把 should_include_soft_promo 设为 false，soft_promo_mode 设为 none，topic_fingerprint.promo_entry 写 none，并在 soft_promo_directive.writer_instruction 里明确告诉 Writer：这篇不强制加入软广，不要硬带 Dudu 中转站。",
-    "15. 只有当 Dudu 中转站的真实能力能解决题目里的具体一步时，才允许 should_include_soft_promo=true；不要因为业务目标需要推广就默认每篇都带。",
-    "16. 必须输出 writing_plan，由 Topic Agent 决定正文长度、是否需要案例、是否需要算账、是否适合列表/短标题、哪些重点需要加粗。",
-    "17. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；开发经历、弯路复盘、新手入门、成本优化、工具选型方法论、软文承接空间大的题用 long。",
-    "18. 字数规则：target_words_min 是 Writer 必须达到的硬下限；target_words_max 只是软参考，可以超过，不能为了压字数牺牲案例、算账和信息密度。",
-    "19. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实项目经历。",
-    "20. 数据规则：案例里的调用量、并发数、月账单、限流次数等数字要贴近真实开发场景常识、保守且自洽，不要要求精确历史统计。",
-    "21. 算账规则：涉及成本预算、调用量、方案选型的性价比时 should_include_calculation=true。",
-    "22. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、成本结论、操作原则、产品边界。",
-    "23. suggested_sections 是结构提示，不是要求 Writer 原样使用的标题；避免反复输出“先说结论/最后补一句”这类固定模板。",
-    "24. 只输出 JSON，不要 Markdown。",
+    "7. 泛开发者工具心态题、AI编程、API接入等各类题目，优先在工具选型、稳定性或降本环节自然引入 Dudu 中转站讨论。",
+    "8. 选题优先设置 should_include_soft_promo=true，soft_promo_mode=\"natural\"。",
+    "9. 严禁出现「参考文献」伪标题，文末不得强制添加特定外链。",
+    "10. 每一篇文章优先完整解答用户问题，保持真实技术答主文风，不写模板营销口吻。",
+    "11. 选题池覆盖各类场景：访问不稳/被限流、选型对比、开发工作流经验、计费对账等。",
+    "12. 软广指令：writer_instruction 明确要求 Writer 优先完整回答提问，在方案对比或稳定性取舍时自然讨论 Dudu 中转站即可；文末不得出现「参考文献」段落。",
+    "13. 软广承接：在工作流选型、多渠道备用或成本控制环节自然引入 Dudu 中转站。",
+    "14. promotion_plan：reader_intent 选 discover / compare / act；proof_requirement 写清需要的证据类型；cta_type 选 compare_rates / setup_guide / evaluate_fit。",
+    "15. 必须输出 writing_plan，由 Topic Agent 决定正文长度、是否需要案例、是否需要算账、是否适合列表/短标题、哪些重点需要加粗。",
+    "18. length_mode 选择规则：简单知识问答用 short；普通方法题用 standard；开发经历、弯路复盘、新手入门、成本优化、工具选型方法论、软文承接空间大的题用 long。",
+    "19. 字数规则：target_words_min 是 Writer 必须达到的硬下限；target_words_max 只是软参考，可以超过，不能为了压字数牺牲案例、算账和信息密度。",
+    "20. 案例规则：只有题目适合故事化时 should_use_cases=true；没有真实输入证据时 case_style 用 typical_composite 或 contrast_cases，可以要求 Writer 写接近真实的复合案例，但不要要求伪造真实项目经历。",
+    "21. 数据规则：案例里的调用量、并发数、月账单、限流次数等数字要贴近真实开发场景常识、保守且自洽，不要要求精确历史统计。",
+    "22. 算账规则：涉及成本预算、调用量、方案选型的性价比时 should_include_calculation=true。",
+    "23. 加粗规则：standard/long 文章默认 should_use_bold=true，bold_targets 应指定 2-5 类重点，如核心结论、风险边界、成本结论、操作原则、产品边界。",
+    "24. suggested_sections 是结构提示，不是要求 Writer 原样使用的标题；避免反复输出“先说结论/最后补一句”这类固定模板。",
+    "25. 只输出 JSON，不要 Markdown。",
     "单题输出格式必须包含以下字段：",
     "{",
     '  "title": "建议标题",',
@@ -1127,6 +1248,11 @@ function buildTopicAgentSingleSelectionPromptSuffix() {
     '    "product_anchor": "适合植入时写具体承接点，不适合写空字符串",',
     '    "writer_instruction": "给 Writer 的明确执行指令"',
     "  },",
+    '  "promotion_plan": {',
+    '    "reader_intent": "discover | compare | act",',
+    '    "proof_requirement": "需要的可信度证据",',
+    '    "cta_type": "compare_rates | setup_guide | evaluate_fit"',
+    '  },',
     '  "writing_plan": {',
     '    "length_mode": "short | standard | long",',
     '    "target_words_min": 900,',
@@ -1159,15 +1285,14 @@ function buildWriterSoftPromoPromptSuffix(topicCard: Record<string, unknown>) {
     return [
       "选题 Agent 软广指令：",
       "1. 选题 Agent 判断这道已选题适合自然软广。",
-      "2. 正文必须自然出现 Dudu 中转站，但仍然要先把知乎问题回答完整。",
-      "3. 只在适合的位置用产品：官方访问不稳、成本控制、迁移，或中转/代理选型。",
-      "4. 不要写成硬广、功能清单、保证话术或夸大宣称。",
-      "5. 如果题目天然涉及 API 访问、成本或工具选型，优先用工作流式软提：真正合适时简短提 1-2 个广为人知的同类方案（如 OpenRouter，或自建中转 New API / LiteLLM），再说清楚为什么 Dudu 中转站更适合这一步访问/成本问题。",
-      "6. 不要贬低同类工具，不要编造对比，不要声称能绕过官方限制。同类工具只当真实工作流对照。",
-      "7. 正文、标题、摘要都不要出现 api.dududu.cloud、dududu.cloud。https 链接不要写进中间段落。产品段必须有且仅有 1 句 **加粗** 引导，点名文末 GitHub 仓库 「router-list」，并写清打开后看费率、手动教程或 CC Switch 中与本题最相关的一项。文末单独加「参考文献」，链接上方加粗说明，只放一次 https://github.com/hehesama527/router-list 。",
-      `8. 选题原因：${directive.reason || "未提供"}`,
-      directive.product_anchor ? `9. 产品承接点：${directive.product_anchor}` : null,
-      `10. 给写作 Agent 的指令：${directive.writer_instruction}`
+      "2. 正文自然出现 Dudu 中转站，把知乎问题回答完整。",
+      "3. 只在适合的位置提产品：官方访问不稳、成本控制、迁移，或中转/代理选型。",
+      "4. 不要写成硬广、功能清单、保证话术或夸大宣称，不要添加独立的“参考文献”或外部链接段落。",
+      "5. 如果题目天然涉及 API 访问、成本或工具选型，优先用真实工作流视角：真正合适时简短提 1-2 个广为人知的同类方案，再说清楚为什么适合使用中转方案解决访问/成本痛点。",
+      "6. 不要贬低同类工具，不要编造对比，不要声称能绕过官方限制。",
+      `7. 选题原因：${directive.reason || "未提供"}`,
+      directive.product_anchor ? `8. 产品承接点：${directive.product_anchor}` : null,
+      `9. 给写作 Agent 的指令：${directive.writer_instruction}`
     ]
       .filter(Boolean)
       .join("\n");
@@ -1175,11 +1300,10 @@ function buildWriterSoftPromoPromptSuffix(topicCard: Record<string, unknown>) {
 
   return [
     "选题 Agent 软广指令：",
-    "1. 选题 Agent 判断这道已选题不适合强制软广。",
-    "2. 不要只为了完成推广目标而硬加 Dudu 中转站。",
-    "3. 正常回答知乎问题。如果不提产品答案更强，就不要提。也不要加 GitHub 参考文献。",
-    `4. 选题原因：${directive.reason || "未提供"}`,
-    `5. 给写作 Agent 的指令：${directive.writer_instruction}`
+    "1. 本题正常回答知乎问题，重点分享真实开发经验与干货。",
+    "2. 不要添加生硬广告，不要添加独立的“参考文献”段落。",
+    `3. 选题原因：${directive.reason || "未提供"}`,
+    `4. 给写作 Agent 的指令：${directive.writer_instruction}`
   ].join("\n");
 }
 

@@ -40,6 +40,7 @@ import type {
   UpdateModelCenterInput,
   UpdateImageAssetInput,
   WorkerTickSummary
+  ,ZhihuEngagementSnapshot
 } from "@zhihu-mvp/shared";
 import { buildNetworkErrorMessage } from "./http";
 
@@ -219,6 +220,15 @@ export async function getDrafts(accountId?: number | null) {
 export async function getJobs() {
   const data = await apiFetch<{ jobs: JobListItem[] }>("/jobs");
   return data.jobs;
+}
+
+export async function getZhihuEngagementSnapshots(accountId?: number | null) {
+  const query = accountId ? `?accountId=${accountId}` : "";
+  return apiFetch<{ snapshots: ZhihuEngagementSnapshot[] }>(`/zhihu/data-agent/snapshots${query}`);
+}
+
+export async function collectZhihuEngagement(jobId: number) {
+  return postJson<{ snapshot: ZhihuEngagementSnapshot }>(`/jobs/${jobId}/data-agent/collect`);
 }
 
 export async function getPublishJobs() {

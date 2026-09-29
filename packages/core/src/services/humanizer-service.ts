@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { modelCenterAgentNames } from "@zhihu-mvp/shared";
 import { getAppConfig } from "../config/env.js";
-import { createOpenAiClient, readLlmRuntimeConfig, type LlmRuntimeConfig } from "../config/llm-provider.js";
+import { createOpenAiClient, readLlmRuntimeConfig, resolveLlmQuotaFallbacks, type LlmRuntimeConfig } from "../config/llm-provider.js";
 import { JobRepository } from "../repositories/job-repository.js";
 import { getElapsedMs, logDebugTiming } from "../utils/debug-timing.js";
 import { extractResponseText, parseJsonOrThrow } from "../utils/json.js";
@@ -61,7 +61,8 @@ export class HumanizerService {
         runtime,
         buildHumanizerMessages(prompt, content, context?.extraSystemPrompt),
         {
-          initialResponseTimeoutMs: HUMANIZER_TIMEOUT_MS
+          initialResponseTimeoutMs: HUMANIZER_TIMEOUT_MS,
+          quotaFallbacks: resolveLlmQuotaFallbacks(runtimeTarget)
         }
       );
 
@@ -74,7 +75,12 @@ export class HumanizerService {
       let parsed = directParse.response;
       if (!parsed) {
         try {
-          repairedResponseText = await repairHumanizerResponse(rawResponseText, client, runtime);
+          repairedResponseText = await repairHumanizerResponse(
+            rawResponseText,
+            client,
+            runtime,
+            resolveLlmQuotaFallbacks(runtimeTarget)
+          );
         } catch (error) {
           repairErrorMessage = toErrorMessage(error);
           throw error;
@@ -119,9 +125,9 @@ export class HumanizerService {
         publishJobId: context?.publishJobId ?? null,
         stage: context?.stage ?? "humanizing",
         elapsedMs: getElapsedMs(startedAt),
-        repairApplied: Boolean(repairedResponseText),
         parseMode
       });
+
       return parsed;
     } catch (error) {
       if (this.jobRepository) {
@@ -200,13 +206,17 @@ function loadHumanizerPrompt() {
 1. 严格遵守上面的 humanizer-zh 规则。
 2. 不得改变事实边界、观点边界和核心结论。
 3. 不得新增虚构数据。
-4. 不要把“去 AI 味”理解为压缩正文。默认保留原文信息量，处理后长度不要低于原文的 85%，除非原文有明显重复废话。
-5. 必须保留发布结构：如果原文有 **加粗** 重点，至少保留大部分加粗标记；如果原文有短列表、步骤清单或自检问题，不要全部改成普通段落。
+4. 默认保留原文核心信息量，处理后长度不要低于原文的 80%，除非原文有明显重复废话。
+5. 必须彻底消除 AI 模版八股与机械结构：
+   - 严禁使用“**核心结论：**”、“**起步原则是：**”等生硬加粗小标题，改用口语过渡或自然段落；
+   - 严禁使用“第一天到第二天...第七天”之类的打卡打卡式排比结构，将其打碎重构为经验复盘；
+   - 严禁使用“不是X而是Y”、“不在于X而在于Y”等假大空对仗金句；
+   - 严禁使用“参考文献”字样；文末严禁附加任何外链，自然收尾即可；
+   - 句式长短剧烈交错，多用接地气的人类第一人称口语感（“我自己实测”、“踩过的大坑”、“当时差点搞出事故”），提高语言的突发性与呼吸感。
 6. 必须保留产品名（Dudu 中转站 / Dudu）、同类工具名、模型名、关键数字、账单区间、限流次数、超时时间和备用方案等事实信息。
-7. 不得新增 api.dududu.cloud、dududu.cloud 或任何直接 API 域名。如果原文有指向文末 GitHub 仓库 「router-list」 的 **加粗** 引导句，必须保留加粗和仓库名。如果原文有「参考文献」和 https://github.com/hehesama527/router-list，必须原样保留，不要删掉、改写链接，或把 URL 挪进正文中间。
-8. 可以调整句式、连接词、段落节奏和口语感，但不要删除 Topic/Review 可能依赖的结构锚点，例如粗体重点、列表、案例动作链和算账段。
-9. 输出必须是 JSON，不要 Markdown，不要解释。
-10. 输出格式固定为：
+7. 不得新增 api.dududu.cloud、dududu.cloud 或任何直接 API 域名。文末严禁出现「参考文献」伪标题。
+8. 输出必须是 JSON，不要 Markdown，不要解释。
+9. 输出格式固定为：
 {
   "content": "处理后的正文",
   "notes": ["说明做了哪些自然化处理"]
@@ -266,7 +276,8 @@ function tryParseHumanizerResponse(value: string): HumanizerParseAttempt {
 async function repairHumanizerResponse(
   brokenResponse: string,
   client: ReturnType<typeof createOpenAiClient>,
-  runtime: LlmRuntimeConfig
+  runtime: LlmRuntimeConfig,
+  quotaFallbacks: ReturnType<typeof resolveLlmQuotaFallbacks>
 ) {
   const repairPrompt = `You repair malformed JSON returned by a Chinese writing-humanizer tool.
 
@@ -300,7 +311,8 @@ Your task:
       }
     ],
     {
-      initialResponseTimeoutMs: HUMANIZER_REPAIR_TIMEOUT_MS
+      initialResponseTimeoutMs: HUMANIZER_REPAIR_TIMEOUT_MS,
+      quotaFallbacks
     }
   );
 

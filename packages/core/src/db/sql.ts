@@ -566,6 +566,23 @@ CREATE TABLE IF NOT EXISTS zhihu_scraped_content (
   UNIQUE KEY uniq_zhihu_scraped_content_source (source_account, content_type, content_id),
   INDEX idx_zhihu_scraped_content_query (source_account, status, scraped_at)
 );
+
+CREATE TABLE IF NOT EXISTS zhihu_engagement_snapshots (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  publish_job_id INT NOT NULL,
+  account_id INT NOT NULL,
+  post_url VARCHAR(1024) NOT NULL,
+  vote_count INT NOT NULL DEFAULT 0,
+  comment_count INT NOT NULL DEFAULT 0,
+  comments_json LONGTEXT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'succeeded',
+  error_message LONGTEXT NULL,
+  collected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_zhihu_engagement_job_collected (publish_job_id, collected_at),
+  INDEX idx_zhihu_engagement_account_collected (account_id, collected_at),
+  CONSTRAINT fk_zhihu_engagement_job FOREIGN KEY (publish_job_id) REFERENCES publish_jobs(id),
+  CONSTRAINT fk_zhihu_engagement_account FOREIGN KEY (account_id) REFERENCES accounts(id)
+);
 `;
 
 type ColumnMigration = {

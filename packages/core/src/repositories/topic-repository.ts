@@ -643,11 +643,19 @@ export class TopicRepository {
       params
     );
 
-    return rows.map((row) => ({
-      title: row.question_title as string,
-      summary: row.summary_text as string,
-      topicCardJson: row.output_json as string
-    }));
+    return rows.map((row) => {
+      let topic_fingerprint: unknown = null;
+      try {
+        const parsed = JSON.parse(row.output_json as string);
+        topic_fingerprint = parsed.topic_fingerprint ?? null;
+      } catch {}
+
+      return {
+        title: row.question_title as string,
+        summary: row.summary_text as string,
+        topic_fingerprint
+      };
+    });
   }
 
   async getRecentPublishedContentFingerprints(limit = 10) {
@@ -664,11 +672,27 @@ export class TopicRepository {
       [limit]
     );
 
-    return rows.map((row) => ({
-      title: row.question_title as string,
-      content: (row.approved_content as string | null) ?? "",
-      draftJson: row.output_json as string
-    }));
+    return rows.map((row) => {
+      let fingerprint: unknown = null;
+      let summary = "";
+      try {
+        const parsed = JSON.parse(row.output_json as string);
+        fingerprint = parsed.fingerprint ?? null;
+        if (typeof parsed.summary === "string" && parsed.summary.trim()) {
+          summary = parsed.summary.trim().slice(0, 300);
+        }
+      } catch {}
+
+      if (!summary && typeof row.approved_content === "string") {
+        summary = row.approved_content.trim().slice(0, 300);
+      }
+
+      return {
+        title: row.question_title as string,
+        summary,
+        fingerprint
+      };
+    });
   }
 
   async findClaimedQuestionByUrl(questionUrl: string | null | undefined, excludeCandidateId?: number | null) {
@@ -928,6 +952,19 @@ export class TopicRepository {
 
   async getReviewById(reviewId: number) {
     const [rows] = await this.pool.query<ReviewRow[]>(`SELECT * FROM reviews WHERE id = ? LIMIT 1`, [reviewId]);
+    return rows[0] ?? null;
+  }
+
+  async getLatestReviewForTopicCard(topicCardId: number) {
+    const [rows] = await this.pool.query<ReviewRow[]>(
+      `SELECT rv.*
+       FROM reviews rv
+       JOIN drafts d ON d.id = rv.draft_id
+       WHERE d.topic_card_id = ?
+       ORDER BY rv.id DESC
+       LIMIT 1`,
+      [topicCardId]
+    );
     return rows[0] ?? null;
   }
 }

@@ -7,9 +7,10 @@ import type { BrowserContext, Locator, Page } from "playwright-core";
 import type { ToolTraceAction, ToolTraceStage } from "@zhihu-mvp/shared";
 import { getAppConfig } from "../config/env.js";
 import { JobRepository } from "../repositories/job-repository.js";
-import { resolveBrowserProfileDir, getStealthLaunchOptions } from "../utils/browser.js";
+import { resolveBrowserExecutable, resolveBrowserProfileDir, getStealthLaunchOptions } from "../utils/browser.js";
 import { killBrowsersByUserDataDir, killProcessTree } from "../utils/chrome-manual-login.js";
 import { getStealthInitScripts, validateFingerprintConsistency } from "../utils/stealth-inject.js";
+import { normalizeZhihuPublishLabel, ZHIHU_PUBLISH_LABELS } from "../utils/zhihu-publish-targets.js";
 
 /**
  * Split text into natural word groups for human-like typing
@@ -89,6 +90,9 @@ type ClickInput = {
   roles?: Array<"button" | "link">;
   selectors?: string[];
   exact?: boolean;
+  scopeSelectors?: string[];
+  strict?: boolean;
+  allowForce?: boolean;
 };
 
 type FocusInput = {
@@ -148,7 +152,7 @@ export class PlaywrightToolRuntime {
     return this.runWithTrace(traceContext, "open", input, async (page) => {
       await page.goto(input.url, {
         waitUntil: "domcontentloaded",
-        timeout: 60_000
+        timeout: 120_000
       });
       return {
         url: page.url()
@@ -520,6 +524,7 @@ export class PlaywrightToolRuntime {
 
     try {
       const stealthOptions = getStealthLaunchOptions(browserChannel, resolvedProfileDir);
+      const executablePath = resolveBrowserExecutable(browserChannel);
       const localProxyUrl = "http://127.0.0.1:7890";
       const useLocalProxy = await canConnectLocalProxy("127.0.0.1", 7890);
 
@@ -530,6 +535,9 @@ export class PlaywrightToolRuntime {
         headless,
         viewport: headless ? { width: 1440, height: 900 } : null,
         args: stealthOptions.args,
+        launchOptions: {
+          executablePath
+        },
       };
 
       if (useLocalProxy) {
@@ -558,6 +566,8 @@ export class PlaywrightToolRuntime {
       for (const script of initScripts) {
         await context.addInitScript(script);
       }
+      await context.addInitScript("window.__name = window.__name || function(fn) { return fn; };");
+      await page.addInitScript("window.__name = window.__name || function(fn) { return fn; };");
 
       const session: RuntimeSession = {
         context,
@@ -965,7 +975,8 @@ async function readBoundedDomSnapshot(
   let timer: NodeJS.Timeout | null = null;
   const pending = page
     .evaluate(() => {
-      const clean = (value: string | null | undefined) => (value || "").replace(/\s+/g, " ").trim();
+      const clean = (value: string | null | undefined) =>
+        (value || "").replace(/[\u200b-\u200d\uFEFF]/g, "").replace(/\s+/g, " ").trim();
       const takeText = (selector: string, limit: number) =>
         Array.from(document.querySelectorAll(selector))
           .slice(0, limit)
@@ -1006,7 +1017,10 @@ async function readBoundedDomSnapshot(
         editorBoldTexts
       };
     })
-    .catch(() => null);
+    .catch((err) => {
+      console.warn("[playwright] readBoundedDomSnapshot error:", err);
+      return null;
+    });
 
   try {
     const result = await Promise.race([
@@ -1037,6 +1051,47 @@ function mapRuntimeStageToJobStage(stage: RuntimeTraceContext["stage"]) {
 }
 
 async function tryClick(page: Page, input: ClickInput) {
+  const strict = input.strict === true;
+  const allowForce = input.allowForce ?? !strict;
+  if (strict) {
+    const candidateIndex = await findStrictClickCandidate(page, input);
+    if (candidateIndex === null) {
+      return {
+        ok: false,
+        url: page.url()
+      };
+    }
+
+    const candidate = page.locator("button, [role='button']").nth(candidateIndex);
+    await candidate.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
+    if (!(await isUsableClickTarget(candidate))) {
+      return {
+        ok: false,
+        url: page.url()
+      };
+    }
+
+    try {
+      const clickMode = await clickLocator(candidate, {
+        forceOnIntercept: allowForce
+      });
+      return {
+        ok: true,
+        matchedBy: `strict:${candidateIndex}:${clickMode}`,
+        url: page.url()
+      };
+    } catch {
+      return {
+        ok: false,
+        url: page.url()
+      };
+    }
+  }
+
+  const roots: Array<Page | Locator> =
+    input.scopeSelectors && input.scopeSelectors.length > 0
+      ? input.scopeSelectors.map((selector) => page.locator(selector))
+      : [page];
   const expandedNames = Array.from(
     new Set(
       (input.names ?? []).flatMap((n) => [
@@ -1047,58 +1102,42 @@ async function tryClick(page: Page, input: ClickInput) {
   );
 
   const extraSelectors: string[] = [];
-  if (expandedNames.some((n) => n.includes("写回答"))) {
+  if (expandedNames.some((n) => ZHIHU_PUBLISH_LABELS.write.some((label) => n.includes(label)))) {
     extraSelectors.push(
-      ".QuestionHeader-footer button.WriteAnswerButton",
-      ".QuestionHeader-footer button:has-text('写回答')",
-      ".QuestionHeaderActions button.WriteAnswerButton",
-      ".QuestionHeaderActions button:has-text('写回答')",
-      "button.WriteAnswerButton",
-      "button:has-text('写回答')"
-    );
-  }
-  if (expandedNames.some((n) => n.includes("编辑回答"))) {
-    extraSelectors.push(
-      ".QuestionHeader-footer button:has-text('编辑回答')",
-      ".QuestionHeader-footer button.WriteAnswerButton",
-      ".QuestionHeaderActions button:has-text('编辑回答')",
-      ".QuestionHeaderActions button.WriteAnswerButton",
-      "button:has-text('编辑回答')",
+      ...ZHIHU_PUBLISH_LABELS.write.flatMap((label) => [
+        `.QuestionHeader-footer button:has-text('${label}')`,
+        `.QuestionHeaderActions button:has-text('${label}')`,
+        `button:has-text('${label}')`
+      ]),
       "button.WriteAnswerButton"
     );
   }
-  if (expandedNames.some((n) => n.includes("发布回答") || n.includes("提交回答") || n.includes("发布"))) {
-    extraSelectors.push(
-      "button:has-text('发布回答')",
-      "button:has-text('提交回答')",
-      "button:has-text('发布修改')",
-      "button:has-text('保存修改')",
-      ".PublishPanel button:has-text('发布')",
-      ".PublishPanel-btnGroup button:has-text('发布')"
-    );
+  if (expandedNames.some((n) => ZHIHU_PUBLISH_LABELS.submit.some((label) => n.includes(label)))) {
+    extraSelectors.push(...ZHIHU_PUBLISH_LABELS.submit.map((label) => `button:has-text('${label}')`));
   }
   const allSelectors = Array.from(new Set([...(input.selectors ?? []), ...extraSelectors]));
 
-  for (const selector of allSelectors) {
-    const locator = page.locator(selector);
-    const matched = await clickFirstUsableLocator(locator, `selector:${selector}`);
-    if (matched) {
+  const normalizedLabels = expandedNames.filter((name) =>
+    [...ZHIHU_PUBLISH_LABELS.write, ...ZHIHU_PUBLISH_LABELS.submit].some((label) => name.includes(label))
+  );
+  if (normalizedLabels.length > 0 && !strict) {
+    const clicked = await clickNormalizedButton(page, normalizedLabels).catch(() => null);
+    if (clicked) {
       return {
         ok: true,
-        matchedBy: matched.matchedBy,
+        matchedBy: `normalized:${clicked}`,
         url: page.url()
       };
     }
   }
 
-  for (const role of input.roles ?? ["button", "link"]) {
-    for (const name of expandedNames) {
-      const locator = page.getByRole(role, {
-        name,
-        exact: input.exact ?? false
+  for (const selector of allSelectors) {
+    for (const root of roots) {
+      const locator = root.locator(selector);
+      const matched = await clickFirstUsableLocator(locator, `selector:${selector}`, {
+        strict,
+        allowForce
       });
-
-      const matched = await clickFirstUsableLocator(locator, `${role}:${name}`);
       if (matched) {
         return {
           ok: true,
@@ -1109,27 +1148,43 @@ async function tryClick(page: Page, input: ClickInput) {
     }
   }
 
-  for (const name of input.names ?? []) {
-    const locator = page.locator('button, [role="button"], a[href], [role="link"]').filter({ hasText: name });
-    const matched = await clickFirstUsableLocator(locator, `hasText:${name}`);
-    if (matched) {
-      return {
-        ok: true,
-        matchedBy: matched.matchedBy,
-        url: page.url()
-      };
+  for (const role of input.roles ?? ["button", "link"]) {
+    for (const name of expandedNames) {
+      for (const root of roots) {
+        const locator = root.getByRole(role, {
+          name,
+          exact: input.exact ?? false
+        });
+
+        const matched = await clickFirstUsableLocator(locator, `${role}:${name}`, {
+          strict,
+          allowForce
+        });
+        if (matched) {
+          return {
+            ok: true,
+            matchedBy: matched.matchedBy,
+            url: page.url()
+          };
+        }
+      }
     }
   }
 
   for (const name of input.names ?? []) {
-    const locator = page.getByText(name, { exact: false });
-    const matched = await clickFirstUsableLocator(locator, `text:${name}`);
-    if (matched) {
-      return {
-        ok: true,
-        matchedBy: matched.matchedBy,
-        url: page.url()
-      };
+    for (const root of roots) {
+      const locator = root.locator('button, [role="button"], a[href], [role="link"]').filter({ hasText: name });
+      const matched = await clickFirstUsableLocator(locator, `hasText:${name}`, {
+        strict,
+        allowForce
+      });
+      if (matched) {
+        return {
+          ok: true,
+          matchedBy: matched.matchedBy,
+          url: page.url()
+        };
+      }
     }
   }
 
@@ -1139,9 +1194,120 @@ async function tryClick(page: Page, input: ClickInput) {
   };
 }
 
-async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
-  const count = await locator.count();
+async function findStrictClickCandidate(page: Page, input: ClickInput) {
+  const names = (input.names ?? []).map(normalizeClickText).filter(Boolean);
+  const scopeSelectors = input.scopeSelectors ?? [];
+  const submitLabels = ZHIHU_PUBLISH_LABELS.submit.map(normalizeClickText);
+  const allCandidates = page.locator("button, [role='button']");
+  const candidateIndexes = await allCandidates.evaluateAll(
+    (elements, args: { names: string[]; scopeSelectors: string[]; submitLabels: string[] }) => {
+      const normalize = (value: string | null | undefined) =>
+        (value || "").replace(/[\u200b-\u200d\uFEFF]/g, "").replace(/\s+/g, "").trim();
+      const scopes = args.scopeSelectors.flatMap((selector) => {
+        try {
+          return Array.from(document.querySelectorAll(selector));
+        } catch {
+          return [];
+        }
+      });
+      const editorScopes = Array.from(document.querySelectorAll("[contenteditable='true'], [role='textbox']"))
+        .map((editor) =>
+          editor.closest(
+            "form, main, .AnswerForm, .PublishPanel, [class*='AnswerForm'], [class*='PublishPanel']"
+          )
+        )
+        .filter((scope): scope is Element => Boolean(scope));
+      const allowedScopes = Array.from(new Set([...scopes, ...editorScopes]));
+      if (args.scopeSelectors.length > 0 && allowedScopes.length === 0) {
+        return [];
+      }
+      const labels =
+        args.names.length > 0
+          ? args.names
+          : args.submitLabels;
+
+      return elements
+        .map((element, index) => {
+          if (!(element instanceof HTMLElement)) {
+            return null;
+          }
+          if (args.scopeSelectors.length > 0 && !allowedScopes.some((scope) => scope.contains(element))) {
+            return null;
+          }
+
+          const text = normalize(element.textContent);
+          const matchedLabel = labels.find((label) => text === label);
+          if (!matchedLabel) {
+            return null;
+          }
+
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") {
+            return null;
+          }
+          if (element.getAttribute("aria-disabled") === "true" || (element instanceof HTMLButtonElement && element.disabled)) {
+            return null;
+          }
+          if (rect.width <= 0 || rect.height <= 0) {
+            return null;
+          }
+
+          return index;
+        })
+        .filter((index): index is number => index !== null);
+    },
+    {
+      names,
+      scopeSelectors,
+      submitLabels
+    }
+  );
+
+  return candidateIndexes.length === 1 ? candidateIndexes[0] : null;
+}
+
+function normalizeClickText(value: string) {
+  return normalizeZhihuPublishLabel(value);
+}
+
+async function clickNormalizedButton(page: Page, labels: string[]) {
+  return page.evaluate((wanted) => {
+    const normalize = (value: string | null | undefined) =>
+      (value || "").replace(/[\u200b-\u200d\uFEFF]/g, "").replace(/\s+/g, "").trim();
+    const nodes = Array.from(document.querySelectorAll("button, [role='button'], a"));
+    const ranked = nodes
+      .map((node) => {
+        const text = normalize(node.textContent);
+        const label = wanted.find((item) => text === item || text.includes(item));
+        if (!label) {
+          return null;
+        }
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        const visible = style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+        return { node, label, visible, area: rect.width * rect.height };
+      })
+      .filter((item): item is { node: Element; label: string; visible: boolean; area: number } => Boolean(item))
+      .sort((left, right) => Number(right.visible) - Number(left.visible) || right.area - left.area);
+    const target = ranked[0];
+    if (!target || !(target.node instanceof HTMLElement)) {
+      return null;
+    }
+    target.node.scrollIntoView({ block: "center", inline: "center" });
+    target.node.click();
+    return target.label;
+  }, labels);
+}
+
+async function clickFirstUsableLocator(
+  locator: Locator,
+  matchPrefix: string,
+  options: { strict?: boolean; allowForce?: boolean } = {}
+) {
+  const count = Math.min(await locator.count(), 6);
   const interceptedIndexes: number[] = [];
+  const usableIndexes: number[] = [];
 
   for (let index = 0; index < count; index += 1) {
     const candidate = locator.nth(index);
@@ -1150,16 +1316,27 @@ async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
       continue;
     }
 
-    // Skip inactive elements with pointer-events: none (e.g. sticky header buttons before scroll)
-    const isPointerEventsNone = await candidate
-      .evaluate((el) => window.getComputedStyle(el).pointerEvents === "none")
-      .catch(() => false);
-    if (isPointerEventsNone) {
+    if (!(await isUsableClickTarget(candidate))) {
+      continue;
+    }
+    usableIndexes.push(index);
+  }
+
+  if (options.strict && usableIndexes.length !== 1) {
+    return null;
+  }
+
+  const indexes = options.strict ? usableIndexes : Array.from({ length: count }, (_, index) => index);
+  for (const index of indexes) {
+    const candidate = locator.nth(index);
+    if (!(await candidate.isVisible().catch(() => false)) || !(await isUsableClickTarget(candidate))) {
       continue;
     }
 
     try {
-      const clickMode = await clickLocator(candidate);
+      const clickMode = await clickLocator(candidate, {
+        forceOnIntercept: options.allowForce === true
+      });
       return {
         matchedBy: `${matchPrefix}:${index}:${clickMode}`
       };
@@ -1168,13 +1345,12 @@ async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
         interceptedIndexes.push(index);
         continue;
       }
-      // If there are more candidates available, continue trying rather than aborting immediately
-      if (index + 1 < count) {
-        continue;
-      }
-
-      throw error;
+      continue;
     }
+  }
+
+  if (options.allowForce !== true) {
+    return null;
   }
 
   for (const index of interceptedIndexes) {
@@ -1194,29 +1370,43 @@ async function clickFirstUsableLocator(locator: Locator, matchPrefix: string) {
   return null;
 }
 
+async function isUsableClickTarget(locator: Locator) {
+  return locator
+    .evaluate((element) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") {
+        return false;
+      }
+      if (element.getAttribute("aria-disabled") === "true" || (element instanceof HTMLButtonElement && element.disabled)) {
+        return false;
+      }
+
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return hit === element || Boolean(hit && element.contains(hit));
+    })
+    .catch(() => false);
+}
+
 async function clickLocator(locator: Locator, options?: { forceOnIntercept?: boolean }) {
   await locator.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => undefined);
-
-  // Phase 2: Full humanMove with Bezier curve + gaussian jitter (AI-random control points for natural feel)
-  const box = await locator.boundingBox({ timeout: 1000 }).catch(() => null);
-  if (box) {
-    const centerX = box.x + box.width / 2;
-    const centerY = box.y + box.height / 2;
-    // Small random target offset to simulate human inaccuracy
-    const targetX = centerX + (Math.random() * 6 - 3);
-    const targetY = centerY + (Math.random() * 6 - 3);
-    await (locator as any)._pageOrContext?.page?.mouse ? 0 : await (async () => {
-      // The runtime class instance is not directly available in helper, so we call a global or move to class method.
-      // For now we use direct mouse (will be refactored to class method in full integration).
-      // Note: Full humanMove is added as class method below.
-    })();
-  }
 
   try {
     await locator.click({ timeout: 4000 });
     return "default";
   } catch (error) {
     if (!options?.forceOnIntercept || !isPointerInterceptedError(error)) {
+      if (!options?.forceOnIntercept) {
+        throw error;
+      }
       try {
         await locator.click({ force: true, timeout: 3000 });
         return "force";

@@ -56,6 +56,7 @@ export type ResolvedLlmRuntimeConfig = {
   scope: LlmConfigScope;
   runtime: LlmRuntimeConfig;
   fallbackRuntime: LlmRuntimeConfig;
+  quotaFallbackRuntimes: LlmRuntimeConfig[];
   overrides: ModelCenterAgentOverrideFields;
   fallbackFieldSources: ModelCenterFieldSources;
   fieldSources: ModelCenterFieldSources;
@@ -97,20 +98,23 @@ export function resolveLlmRuntimeConfig(target: LlmConfigTarget = "zhihu"): Reso
     baseResolution.runtime.requestTimeoutMs,
     baseResolution.fieldSources.requestTimeoutMs
   );
+  const runtime: LlmRuntimeConfig = {
+    ...baseResolution.runtime,
+    model: model.value,
+    baseUrl: baseUrl.value,
+    apiKey: apiKey.value,
+    reasoningEffort: reasoningEffort.value,
+    wireApi: wireApi.value,
+    requestTimeoutMs: requestTimeoutMs.value,
+    proxyUrl: isLocalUrl(baseUrl.value) ? null : baseResolution.runtime.proxyUrl
+  };
 
   return {
     target,
     scope,
-    runtime: {
-      ...baseResolution.runtime,
-      model: model.value,
-      baseUrl: baseUrl.value,
-      apiKey: apiKey.value,
-      reasoningEffort: reasoningEffort.value,
-      wireApi: wireApi.value,
-      requestTimeoutMs: requestTimeoutMs.value
-    },
+    runtime,
     fallbackRuntime: baseResolution.runtime,
+    quotaFallbackRuntimes: resolveQuotaFallbackRuntimes(target, scope, runtime, baseResolution.runtime),
     overrides,
     fallbackFieldSources: baseResolution.fieldSources,
     fieldSources: {
@@ -145,7 +149,10 @@ const cloudflareSafeClientHeaders = {
 };
 
 export function createOpenAiClient(target: LlmConfigTarget = "zhihu") {
-  const runtime = readLlmRuntimeConfig(target);
+  return createOpenAiClientForRuntime(readLlmRuntimeConfig(target));
+}
+
+export function createOpenAiClientForRuntime(runtime: LlmRuntimeConfig) {
   return new OpenAI({
     apiKey: runtime.apiKey,
     baseURL: runtime.baseUrl,
@@ -153,6 +160,20 @@ export function createOpenAiClient(target: LlmConfigTarget = "zhihu") {
     timeout: runtime.requestTimeoutMs,
     defaultHeaders: cloudflareSafeClientHeaders
   });
+}
+
+export function isVolcanoRuntime(runtime: Pick<LlmRuntimeConfig, "baseUrl" | "model">) {
+  return /volces\.com|volcengine/i.test(runtime.baseUrl) || /doubao/i.test(runtime.model);
+}
+
+export function resolveLlmQuotaFallbacks(target: LlmConfigTarget = "zhihu") {
+  const resolved = resolveLlmRuntimeConfig(target);
+  return resolved.quotaFallbackRuntimes
+    .filter((runtime) => runtime.apiKey && runtime.baseUrl && runtime.model)
+    .map((runtime) => ({
+      client: createOpenAiClientForRuntime(runtime),
+      runtime
+    }));
 }
 
 export function getLlmConfigScope(target: LlmConfigTarget): LlmConfigScope {
@@ -190,7 +211,7 @@ function buildBaseRuntimeResolution(
       reasoningEffort: reasoning.value,
       baseUrl: baseUrl.value,
       apiKey,
-      proxyUrl: resolveProxyUrl(),
+      proxyUrl: isLocalUrl(baseUrl.value) ? null : resolveProxyUrl(),
       wireApi: wireApi.value,
       requestTimeoutMs: requestTimeoutMs.value
     },
@@ -259,6 +280,16 @@ function readScopedEnvOverrides(scope: LlmConfigScope) {
     wireApi: LlmWireApi | null;
     requestTimeoutMs: number | null;
   };
+}
+
+function resolveQuotaFallbackRuntimes(
+  _target: LlmConfigTarget,
+  _scope: LlmConfigScope,
+  _activeRuntime: LlmRuntimeConfig,
+  _baseRuntime: LlmRuntimeConfig
+) {
+  // 全面统一使用 Dudu 中转站，不再使用火山等外部回退
+  return [];
 }
 
 function resolveStringField(envValue: string | null, codexValue: string | undefined, fallback: string) {
@@ -449,4 +480,11 @@ function isModelCenterAgentName(value: string): value is ModelCenterAgentName {
 
 function normalizeOptionalString(value: string | undefined) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function isLocalUrl(url: string | null | undefined): boolean {
+  if (!url) {
+    return false;
+  }
+  return /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?/i.test(url);
 }

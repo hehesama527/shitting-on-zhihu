@@ -90,6 +90,19 @@ export class ScheduleRepository {
     return result.affectedRows === 1;
   }
 
+  async reassignSlotToNextJob(currentSlotId: number, nextJobId: number, nextSlotId?: number | null) {
+    if (nextSlotId && nextSlotId !== currentSlotId) {
+      await this.pool.query(
+        `UPDATE daily_publish_schedule SET publish_job_id = NULL, status = 'pending' WHERE id = ?`,
+        [nextSlotId]
+      );
+    }
+    await this.pool.query(
+      `UPDATE daily_publish_schedule SET publish_job_id = ?, status = 'in_progress' WHERE id = ?`,
+      [nextJobId, currentSlotId]
+    );
+  }
+
   async createAdhocSlot(accountId: number, scheduledAt: Date, status: ScheduleSlot["status"] = "pending") {
     const date = dayjs(scheduledAt).tz(getAppConfig().timezone);
     const [result] = await this.pool.query<ResultSetHeader>(

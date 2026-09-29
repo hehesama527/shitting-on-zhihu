@@ -1,6 +1,6 @@
 import type { CreatePromptDraftInput, PromptSetName, PromptSetView, PromptTestRunInput, UpdatePromptDraftInput } from "@zhihu-mvp/shared";
 import { defaultPromptSeeds } from "../prompts/default-prompts.js";
-import { createOpenAiClient, readLlmRuntimeConfig } from "../config/llm-provider.js";
+import { createOpenAiClient, readLlmRuntimeConfig, resolveLlmQuotaFallbacks } from "../config/llm-provider.js";
 import { PromptRepository } from "../repositories/prompt-repository.js";
 import { extractResponseText } from "../utils/json.js";
 import { createLlmTextResponse } from "../utils/llm-text.js";
@@ -90,7 +90,9 @@ export class PromptService {
       const response = await createLlmTextResponse(client, runtime, [
         { role: "system", content: promptVersion.content },
         { role: "user", content: JSON.stringify(input.input, null, 2) }
-      ]);
+      ], {
+        quotaFallbacks: resolveLlmQuotaFallbacks(promptVersion.set_name)
+      });
 
       const output = extractResponseText(response);
       const testRunId = await this.promptRepository.recordPromptTestRun(promptVersion.id, JSON.stringify(input.input), output, null);

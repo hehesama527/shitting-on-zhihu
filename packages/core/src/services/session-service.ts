@@ -282,7 +282,7 @@ export class SessionService {
         input,
         fallback
       ),
-      6_000,
+      60_000,
       {
         session_state: "unknown",
         reason: "登录态判断超时，改用页面兜底规则。",
@@ -349,9 +349,11 @@ ${expectedName}
   "confidence": "high | medium | low"
 }`,
         input,
-        fallback
+        fallback,
+        60_000,
+        "publish_agent"
       ),
-      6_000,
+      60_000,
       {
         identity_status: "unknown",
         detected_account_name: null,
@@ -575,6 +577,7 @@ function detectSessionStateHeuristically(input: SessionSnapshotInput): Required<
     "风险验证",
     "账号存在异常"
   ];
+  const weakRiskHints = ["风控", "违规", "风险提示", "内容审核"];
   const loginHints = [
     "登录/注册",
     "注册/登录",
@@ -607,7 +610,12 @@ function detectSessionStateHeuristically(input: SessionSnapshotInput): Required<
     /zhihu\.com\/creator/i.test(input.url) ||
     /zhihu\.com\/notifications/i.test(input.url);
 
-  if (isChallengeUrl || challengeHints.some((text) => combinedText.includes(text))) {
+  const hasStrongChallenge = isChallengeUrl || challengeHints.some((text) => combinedText.includes(text));
+  const hasLoggedInSurface = isKnownLoggedInSurface || activeHints.some((text) => combinedText.includes(text));
+
+  // Generic risk/moderation copy appears in normal feeds and sidebars. It is
+  // not sufficient to block an account when the same snapshot proves login.
+  if (hasStrongChallenge && !hasLoggedInSurface) {
     return {
       session_state: "session_expired",
       reason: "页面进入验证或风控状态，请先人工完成验证后再继续。",
@@ -623,11 +631,19 @@ function detectSessionStateHeuristically(input: SessionSnapshotInput): Required<
     };
   }
 
-  if (isKnownLoggedInSurface || activeHints.some((text) => combinedText.includes(text))) {
+  if (hasLoggedInSurface) {
     return {
       session_state: "active",
       reason: "页面已显示知乎账号的已登录内容，可继续执行。",
       confidence: "medium"
+    };
+  }
+
+  if (weakRiskHints.some((text) => combinedText.includes(text))) {
+    return {
+      session_state: "unknown",
+      reason: "页面包含泛化风险或审核文案，但没有明确验证挑战，暂不阻塞账号。",
+      confidence: "low"
     };
   }
 

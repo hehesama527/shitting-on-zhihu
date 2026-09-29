@@ -100,8 +100,8 @@ Binance API  Python 脚本   飞书 webhook
 律动 RSS     (自动轮询)    (实时推送)
 ```
 
-**完整方案文档：** `C:\Users\Mayn\Documents\AI\Twitter 热点自动化监控方案.md`  
-**启动脚本：** `C:\Users\Mayn\.openclaw\workspace-erniu\scripts\start_monitor.ps1`
+**完整方案文档：** `C:\Users\your_user\Documents\AI\Twitter 热点自动化监控方案.md`  
+**启动脚本：** `C:\Users\your_user\.openclaw\workspace-erniu\scripts\start_monitor.ps1`
 
 ---
 
@@ -227,7 +227,7 @@ backtest、quantitative、trading bot
 
 ### 3.2 热点优先级判断（评分系统 v2.0）⭐
 
-**评分系统文档：** `C:\Users\Mayn\Documents\AI\律动新闻评分标准-v2.0.md`  
+**评分系统文档：** `C:\Users\your_user\Documents\AI\律动新闻评分标准-v2.0.md`  
 **配置脚本：** `scripts/news_monitor.py`  
 **推送阈值：** 60 分（P0≥80 分，P1 60-79 分，P2 40-59 分）
 
@@ -459,7 +459,7 @@ Maria 初审 → 二牛审核 → Lulu 发布
 ### 3.4 热点追踪表
 
 **工具：** Excel / 飞书表格  
-**位置：** `C:\Users\Mayn\Documents\AI\Lulu-Twitter 热点追踪表-YYYYMM.xlsx`
+**位置：** `C:\Users\your_user\Documents\AI\Lulu-Twitter 热点追踪表-YYYYMM.xlsx`
 
 **字段：**
 | 日期 | 热点内容 | 来源 | 优先级 | 是否响应 | 推文链接 | 数据（24h） | 负责人 |
@@ -545,12 +545,12 @@ Maria 初审 → 二牛审核 → Lulu 发布
 
 **截图：**
 - 文件名：`publish-success-YYYYMMDD-HHMM.png`
-- 位置：`C:\Users\Mayn\.openclaw\media\browser\`
+- 位置：`C:\Users\your_user\.openclaw\media\browser\`
 - 内容：推文发布成功页面（包含点赞/转发/评论数）
 
 **数据记录：**
 - 文件名：`Lulu-Twitter 数据记录-YYYYMM.xlsx`
-- 位置：`C:\Users\Mayn\Documents\AI\`
+- 位置：`C:\Users\your_user\Documents\AI\`
 - 字段：日期、推文内容、类型（基础/热点）、曝光量、点赞数、转发数、评论数、粉丝净增
 
 ### 4.7 第六步：数据监测
@@ -733,8 +733,8 @@ Maria 初审 → 二牛审核 → Lulu 发布
 - `memory/Kris-Twitter 第 X 周推文草稿-YYYYMMDD.md`
 - `memory/Maria-Twitter 审核意见-YYYYMMDD.md`
 - `memory/Maria-Twitter 周报-WX.md`
-- `C:\Users\Mayn\Documents\AI\Lulu-Twitter 数据记录-YYYYMM.xlsx`
-- `C:\Users\Mayn\Documents\AI\Lulu-Twitter 热点追踪表-YYYYMM.xlsx`
+- `C:\Users\your_user\Documents\AI\Lulu-Twitter 数据记录-YYYYMM.xlsx`
+- `C:\Users\your_user\Documents\AI\Lulu-Twitter 热点追踪表-YYYYMM.xlsx`
 
 ---
 

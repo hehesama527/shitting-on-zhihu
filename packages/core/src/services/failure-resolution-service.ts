@@ -1,5 +1,6 @@
 import type { FailureType, PromptSnapshotMap, RecoveryAction } from "@zhihu-mvp/shared";
 import { LlmService } from "./llm-service.js";
+import { LayaService } from "./laya-service.js";
 
 export type FailureResolution = {
   action: RecoveryAction;
@@ -7,7 +8,7 @@ export type FailureResolution = {
 };
 
 export class FailureResolutionService {
-  constructor(private readonly llmService?: LlmService) {}
+  constructor(private readonly llmService?: LlmService, private readonly layaService: LayaService = new LayaService()) {}
 
   async resolve(
     input: {
@@ -20,6 +21,13 @@ export class FailureResolutionService {
     void this.llmService;
     void input.context;
     void promptSnapshot;
+    const laya = await this.layaService.decideRetry({ failureType: input.failureType, retryCount: input.retryCount, context: input.context });
+    if (laya?.confidence === "high") {
+      if (laya.action === "manual_login") return { action: "MANUAL_LOGIN", reason: laya.reason };
+      if (laya.action === "stop") return { action: "TERMINAL_FAIL", reason: laya.reason };
+      if (laya.action === "refresh" || laya.action === "reopen") return { action: "RESTART_BROWSER", reason: laya.reason };
+      if (laya.action === "retry") return { action: "RETRY_SAME_SESSION", reason: laya.reason };
+    }
     return mapFailureWithRules(input.failureType, input.retryCount);
   }
 }
@@ -55,6 +63,13 @@ function mapFailureWithRules(failureType: FailureType, retryCount: number): Fail
     };
   }
 
+  if (failureType === "question_unavailable") {
+    return {
+      action: "TERMINAL_FAIL",
+      reason: "知乎问题已失效（已删除/404/已关闭/已锁定），终止该任务并自动切换下一题。"
+    };
+  }
+
   if (failureType === "editor_not_ready") {
     return {
       action: retryCount >= 1 ? "RESTART_BROWSER" : "RETRY_SAME_SESSION",
@@ -71,8 +86,8 @@ function mapFailureWithRules(failureType: FailureType, retryCount: number): Fail
 
   if (failureType === "network_or_page_error") {
     return {
-      action: retryCount >= 1 ? "TERMINAL_FAIL" : "RESTART_BROWSER",
-      reason: retryCount >= 1 ? "页面或网络异常再次发生，终止本次任务。" : "页面或网络异常，先重启浏览器再试一次。"
+      action: retryCount >= 2 ? "TERMINAL_FAIL" : "RESTART_BROWSER",
+      reason: retryCount >= 2 ? "页面或网络异常再次发生，终止本次任务。" : "页面或网络异常，先重启浏览器再试一次。"
     };
   }
 

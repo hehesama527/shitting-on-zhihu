@@ -8,9 +8,19 @@ export type LlmTextMessage = {
   content: string;
 };
 
-export type LlmTextRequestOptions = {
+type LlmTextTimeoutOptions = {
   initialResponseTimeoutMs?: number;
   streamIdleTimeoutMs?: number;
+};
+
+export type LlmTextRequestOptions = LlmTextTimeoutOptions & {
+  quotaFallback?: LlmTextFallback | null;
+  quotaFallbacks?: LlmTextFallback[];
+};
+
+export type LlmTextFallback = {
+  client: OpenAI;
+  runtime: LlmRuntimeConfig;
 };
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 180_000;
@@ -24,7 +34,56 @@ export async function createLlmTextResponse(
   messages: LlmTextMessage[],
   options?: LlmTextRequestOptions
 ): Promise<unknown> {
-  return withRetry("createLlmTextResponse", async () => {
+  const fallbacks = [
+    ...(options?.quotaFallbacks ?? []),
+    ...(options?.quotaFallback ? [options.quotaFallback] : [])
+  ];
+
+  try {
+    return await withRetry(
+      "createLlmTextResponse",
+      () => requestLlmText(client, runtime, messages, options),
+      { retryOnRateLimit: fallbacks.length === 0 }
+    );
+  } catch (error) {
+    if (!fallbacks.length || !isRateLimitError(error)) {
+      throw error;
+    }
+
+    let lastError = error;
+    for (const [index, fallback] of fallbacks.entries()) {
+      console.error("[llm] rate limit, switching to backup api", {
+        backupIndex: index + 1,
+        fromModel: runtime.model,
+        fromBaseUrl: runtime.baseUrl,
+        toModel: fallback.runtime.model,
+        toBaseUrl: fallback.runtime.baseUrl
+      });
+
+      try {
+        return await withRetry(
+          `createLlmTextResponse:backup-${index + 1}`,
+          () => requestLlmText(fallback.client, fallback.runtime, messages, options),
+          { retryOnRateLimit: false }
+        );
+      } catch (fallbackError) {
+        lastError = fallbackError;
+        if (!shouldTryNextFallback(fallbackError)) {
+          throw fallbackError;
+        }
+      }
+    }
+
+    throw lastError;
+  }
+}
+
+async function requestLlmText(
+  client: OpenAI,
+  runtime: LlmRuntimeConfig,
+  messages: LlmTextMessage[],
+  options?: LlmTextRequestOptions
+) {
     const initialResponseTimeoutMs = normalizeTimeout(options?.initialResponseTimeoutMs, 120_000);
     const streamIdleTimeoutMs = normalizeTimeout(options?.streamIdleTimeoutMs, DEFAULT_STREAM_IDLE_TIMEOUT_MS);
 
@@ -84,7 +143,6 @@ export async function createLlmTextResponse(
         `LLM non-streaming fallback timeout after ${initialResponseTimeoutMs}ms (channel may not support non-streaming requests).`
       );
     }
-  });
 }
 
 function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -110,13 +168,14 @@ async function createStreamingChatCompletionText(
   client: OpenAI,
   runtime: LlmRuntimeConfig,
   messages: LlmTextMessage[],
-  options: Required<LlmTextRequestOptions>
+  options: Required<LlmTextTimeoutOptions>
 ) {
   const controller = new AbortController();
   const stream = await client.chat.completions.create(
     {
       model: runtime.model,
       messages,
+      max_tokens: 8192,
       stream: true
     },
     {
@@ -156,7 +215,7 @@ async function createStreamingResponsesText(
   client: OpenAI,
   runtime: LlmRuntimeConfig,
   messages: LlmTextMessage[],
-  options: Required<LlmTextRequestOptions>
+  options: Required<LlmTextTimeoutOptions>
 ) {
   const controller = new AbortController();
   const stream = await client.responses.create(
@@ -291,13 +350,20 @@ function normalizeTimeout(value: number | undefined, fallback: number) {
   return fallback;
 }
 
-async function withRetry<T>(scope: string, request: () => Promise<T>): Promise<T> {
+async function withRetry<T>(
+  scope: string,
+  request: () => Promise<T>,
+  options?: { retryOnRateLimit?: boolean }
+): Promise<T> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     try {
       return await request();
     } catch (error) {
       const diagnostics = extractErrorDiagnostics(error);
-      const shouldRetry = attempt < MAX_RETRIES && isRetryableError(diagnostics);
+      const shouldRetry =
+        attempt < MAX_RETRIES &&
+        isRetryableError(diagnostics) &&
+        (options?.retryOnRateLimit !== false || diagnostics.status !== 429);
 
       console.error("[llm] request failed", {
         scope,
@@ -319,7 +385,37 @@ async function withRetry<T>(scope: string, request: () => Promise<T>): Promise<T
   throw new Error("LLM request failed after retries.");
 }
 
+export function isAccountQuotaExceeded(error: unknown) {
+  const diagnostics = extractErrorDiagnostics(error);
+  const text = `${diagnostics.code ?? ""} ${diagnostics.message} ${diagnostics.causeMessage ?? ""}`;
+  return /AccountQuotaExceeded|usage quota|weekly usage quota|额度/i.test(text);
+}
+
+export function isRateLimitError(error: unknown) {
+  const diagnostics = extractErrorDiagnostics(error);
+  const text = `${diagnostics.code ?? ""} ${diagnostics.message} ${diagnostics.causeMessage ?? ""}`.toLowerCase();
+  return diagnostics.status === 429 || /\b429\b|rate.?limit|usage quota|accountquotaexceeded|额度/.test(text);
+}
+
+function shouldTryNextFallback(error: unknown) {
+  const diagnostics = extractErrorDiagnostics(error);
+  if (isRateLimitError(error)) {
+    return true;
+  }
+
+  if (diagnostics.status === 401 || diagnostics.status === 403) {
+    return true;
+  }
+
+  return isRetryableError(diagnostics) || /empty stream|returned an empty/i.test(diagnostics.message);
+}
+
 function isRetryableError(input: ReturnType<typeof extractErrorDiagnostics>) {
+  const quotaText = `${input.code ?? ""} ${input.message} ${input.causeMessage ?? ""}`;
+  if (/AccountQuotaExceeded|usage quota|weekly usage quota|额度/i.test(quotaText)) {
+    return false;
+  }
+
   if (input.status && RETRYABLE_HTTP_STATUS.has(input.status)) {
     return true;
   }
@@ -335,6 +431,7 @@ function isRetryableError(input: ReturnType<typeof extractErrorDiagnostics>) {
     text.includes("timeout") ||
     text.includes("network") ||
     text.includes("temporarily unavailable") ||
+    text.includes("overloaded") ||
     text.includes("stream was interrupted") ||
     text.includes("stream_read_error")
   );
@@ -365,7 +462,18 @@ function toDiagnosticError(error: unknown, diagnostics: ReturnType<typeof extrac
   ].filter(Boolean);
 
   const wrapped = new Error(`LLM request failed: ${parts.join(" | ")}`);
-  (wrapped as { cause?: unknown }).cause = error;
+  const wrappedRecord = wrapped as Error & {
+    cause?: unknown;
+    status?: number | null;
+    code?: string | null;
+    syscall?: string | null;
+    hostname?: string | null;
+  };
+  wrappedRecord.cause = error;
+  wrappedRecord.status = diagnostics.status;
+  wrappedRecord.code = diagnostics.code;
+  wrappedRecord.syscall = diagnostics.syscall;
+  wrappedRecord.hostname = diagnostics.hostname;
   return wrapped;
 }
 

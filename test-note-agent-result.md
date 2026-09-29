@@ -43,7 +43,7 @@ Next.js Web          3001    ✅ 运行中
 ### 5. API 密钥配置 ✅
 - ✅ Qwen3.5-plus API 密钥已配置
 - ✅ API Base URL: https://coding.dashscope.aliyuncs.com/v1
-- ✅ API Key: sk-sp-e762d60c6f6f452e88c153b104d6378d
+- ✅ API Key: your_api_key
 
 ### 6. X API 服务 ✅
 - ✅ X API 服务已启动 (端口 8788)

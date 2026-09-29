@@ -105,8 +105,8 @@
 ## 🔧 配置验证
 
 ### 环境变量 ✅
-- ✅ `MYSQL_URL`: mysql://root:root12581@127.0.0.1:6306/zhihu_mvp
-- ✅ `X_AGENT_API_KEY`: sk-sp-e762d60c6f6f452e88c153b104d6378d
+- ✅ `MYSQL_URL`: mysql://root:your_password@127.0.0.1:6306/zhihu_mvp
+- ✅ `X_AGENT_API_KEY`: your_api_key
 - ✅ `X_AGENT_BASE_URL`: https://coding.dashscope.aliyuncs.com/v1
 - ✅ `X_AGENT_MODEL`: qwen3.5-plus
 

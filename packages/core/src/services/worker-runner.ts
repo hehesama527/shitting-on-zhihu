@@ -15,11 +15,12 @@ import { FeishuNotificationService } from "./feishu-notification-service.js";
 import { FailureResolutionService } from "./failure-resolution-service.js";
 import { LlmService } from "./llm-service.js";
 import { OpsIncidentService } from "./ops-incident-service.js";
-import { PublishFlowError, PublishService, type PublishResumeAnchor } from "./publish-service.js";
+import { PublishFlowError, PublishService, type PublishResumeAnchor, type PublishSubmitState } from "./publish-service.js";
 import { ScheduleService } from "./schedule-service.js";
 import { SessionStateError } from "./session-service.js";
 import type { AccountPromptContext } from "./account-prompt-context.js";
 import { TopicDiscoveryService } from "./topic-discovery-service.js";
+import { isAccountQuotaExceeded } from "../utils/llm-text.js";
 import {
   planTopicAssignments,
   SHARED_TOPIC_BATCH_SIZE,
@@ -38,11 +39,36 @@ type PrepareJobResult = {
   message: string | null;
 };
 
+type ResumedDraftResult = {
+  kind: "ready";
+  title: string;
+  topicCardId: number;
+  reviewId: number;
+  approvedContent: string;
+  promptVersionSnapshotJson: string;
+} | {
+  kind: "duplicate" | "blocked";
+  reason: string;
+  reviewId?: number;
+} | null;
+
 type WorkerAccount = NonNullable<Awaited<ReturnType<AccountRepository["getAccount"]>>>;
-const MAX_PREPARE_CONCURRENCY = 3;
-const MAX_PREPARE_JOBS_PER_ACCOUNT = 1;
+const rawPrepareConcurrency = process.env.MAX_PREPARE_CONCURRENCY;
+const MAX_PREPARE_CONCURRENCY =
+  rawPrepareConcurrency !== undefined && Number(rawPrepareConcurrency) > 0
+    ? Math.floor(Number(rawPrepareConcurrency))
+    : 1;
+const rawJobsPerAccount = process.env.MAX_PREPARE_JOBS_PER_ACCOUNT;
+const MAX_PREPARE_JOBS_PER_ACCOUNT =
+  rawJobsPerAccount !== undefined && Number(rawJobsPerAccount) > 0
+    ? Math.floor(Number(rawJobsPerAccount))
+    : 1;
 const PREPARE_CANDIDATE_FETCH_LIMIT = 30;
-const PREPARE_WINDOW_MINUTES = 120;
+const rawPrepareWindow = process.env.PREPARE_WINDOW_MINUTES;
+const PREPARE_WINDOW_MINUTES =
+  rawPrepareWindow !== undefined && Number(rawPrepareWindow) > 0
+    ? Math.floor(Number(rawPrepareWindow))
+    : 24 * 60;
 const PUBLISH_ATTEMPT_TIMEOUT_MS = 600_000;
 const HARVEST_TIMEOUT_MS = 8 * 60 * 1000;
 const CHALLENGE_PAGE_KEEP_OPEN_MS = 15 * 60 * 1000;
@@ -221,6 +247,30 @@ export class WorkerRunner {
     let latestJob: JobDetail | null = job;
 
     if (preparationStatuses.has(job.status)) {
+      const activeCandidateCount = await this.topicRepository.countActiveCandidates(account.id);
+      if (shouldHarvestAccountPool({ activeCandidateCount })) {
+        const harvestResult = await this.harvestCandidatesForRunNow(job, account);
+        latestJob = await this.jobRepository.getJobById(jobId);
+        if (harvestResult.blockedByLogin) {
+          return {
+            prepared: false,
+            processed: false,
+            blockedByLogin: true,
+            message: harvestResult.message,
+            job: latestJob
+          };
+        }
+        if (harvestResult.message) {
+          return {
+            prepared: false,
+            processed: false,
+            blockedByLogin: false,
+            message: harvestResult.message,
+            job: latestJob
+          };
+        }
+      }
+
       const prepareResult = await this.prepareJob(job, account);
       prepared = prepareResult.prepared;
       latestJob = await this.jobRepository.getJobById(jobId);
@@ -279,6 +329,84 @@ export class WorkerRunner {
 
   async closeAllSessions() {
     await this.publishService.closeAllSessions();
+  }
+
+  private async harvestCandidatesForRunNow(
+    job: JobDetail,
+    account: WorkerAccount
+  ): Promise<{ blockedByLogin: boolean; message: string | null }> {
+    const promptSnapshot = job.promptVersionSnapshotJson
+      ? safeParseJson<PromptSnapshotMap>(job.promptVersionSnapshotJson, {})
+      : undefined;
+
+    try {
+      const soulContext = await this.ensureAccountSoulDocument(account);
+      await this.jobRepository.updateJobStatus(job.id, "topic_discovery", {
+        currentStage: "topic_discovery",
+        promptVersionSnapshotJson: job.promptVersionSnapshotJson,
+        failureReason: null,
+        lastErrorType: null
+      });
+
+      await this.topicDiscoveryService.harvestCandidates({
+        accountId: account.id,
+        profileDir: account.profileDir as string,
+        promptSnapshot,
+        accountContext: toAccountPromptContext(account),
+        accountSoulMarkdown: soulContext.markdown,
+        fillSharedBatch: true
+      });
+    } catch (error) {
+      if (error instanceof SessionStateError) {
+        await this.pauseAccountForLogin(job.accountId, error.message, {
+          jobId: job.id,
+          slotId: job.scheduleSlotId,
+          failureType: mapSessionFailureType(error.sessionState),
+          triggerStage: "topic_discovery"
+        });
+        return {
+          blockedByLogin: true,
+          message: error.message
+        };
+      }
+
+      const message = error instanceof Error ? error.message : "采题时发生未知错误。";
+      console.error("[worker] run-now topic discovery failed", {
+        jobId: job.id,
+        accountId: account.id,
+        error: message
+      });
+      await this.jobRepository.updateJobStatus(job.id, "queued", {
+        currentStage: "queued",
+        promptVersionSnapshotJson: job.promptVersionSnapshotJson,
+        failureReason: `采题失败：${message}`,
+        lastErrorType: "network_or_page_error"
+      });
+      return {
+        blockedByLogin: false,
+        message: `采题失败：${message}`
+      };
+    }
+
+    const activeCandidateCount = await this.topicRepository.countActiveCandidates(account.id);
+    if (activeCandidateCount <= 0) {
+      const message = "采题完成，但没有产生可用选题，任务继续等待下一次采题。";
+      await this.jobRepository.updateJobStatus(job.id, "queued", {
+        currentStage: "queued",
+        promptVersionSnapshotJson: job.promptVersionSnapshotJson,
+        failureReason: message,
+        lastErrorType: null
+      });
+      return {
+        blockedByLogin: false,
+        message
+      };
+    }
+
+    return {
+      blockedByLogin: false,
+      message: null
+    };
   }
 
   private async fillScheduleSlots(account: WorkerAccount) {
@@ -527,7 +655,7 @@ export class WorkerRunner {
 
   private async prepareJob(job: JobListItem, account: WorkerAccount): Promise<PrepareJobResult> {
     const leaseOwner = `prepare-${process.pid}-${randomUUID()}`;
-    if (!(await this.jobRepository.claimJob(job.id, leaseOwner, "prepare"))) {
+    if (!(await this.jobRepository.claimJob(job.id, leaseOwner, "prepare", 45))) {
       return { prepared: false, blockedByLogin: false, message: "任务已被其他 Worker 准备。" };
     }
     try {
@@ -540,27 +668,32 @@ export class WorkerRunner {
       });
       const promptContext = await this.ensurePromptSnapshot(job, account, leaseOwner);
       const soulContext = await this.ensureSoulSnapshot(job, account, leaseOwner);
-      const preparedDraft = await this.topicPipelineService.prepareNextPublishableDraft({
-        publishJobId: job.id,
-        promptSnapshot: promptContext.promptSnapshot,
-        accountContext: toAccountPromptContext(account),
-        accountSoulMarkdown: soulContext.soulMarkdownSnapshot,
-        onStage: async (stage) => {
-          logDebugTiming("worker.prepareQueuedJobs", "job_stage", {
-            jobId: job.id,
-            accountId: job.accountId,
-            stage,
-            elapsedMs: getElapsedMs(jobStartedAt)
+      const onStage = async (stage: JobStage) => {
+        logDebugTiming("worker.prepareQueuedJobs", "job_stage", {
+          jobId: job.id,
+          accountId: job.accountId,
+          stage,
+          elapsedMs: getElapsedMs(jobStartedAt)
+        });
+        await this.jobRepository.renewJobLease(job.id, leaseOwner, 45);
+        await this.jobRepository.updateJobStatus(job.id, stage, {
+          leaseOwner,
+          currentStage: stage,
+          promptVersionSnapshotJson: promptContext.promptSnapshotJson,
+          failureReason: null,
+          lastErrorType: null
+        });
+      };
+
+      const preparedDraft = job.topicCardId && job.reviewId
+        ? await this.resumeExistingReview(job, account, promptContext.promptSnapshot, soulContext.soulMarkdownSnapshot, onStage)
+        : await this.topicPipelineService.prepareNextPublishableDraft({
+            publishJobId: job.id,
+            promptSnapshot: promptContext.promptSnapshot,
+            accountContext: toAccountPromptContext(account),
+            accountSoulMarkdown: soulContext.soulMarkdownSnapshot,
+            onStage
           });
-          await this.jobRepository.updateJobStatus(job.id, stage, {
-            leaseOwner,
-            currentStage: stage,
-            promptVersionSnapshotJson: promptContext.promptSnapshotJson,
-            failureReason: null,
-            lastErrorType: null
-          });
-        }
-      });
 
       if (!preparedDraft) {
         await this.jobRepository.updateJobStatus(job.id, "queued", {
@@ -582,19 +715,20 @@ export class WorkerRunner {
         };
       }
 
-      if (preparedDraft.kind === "blocked") {
+      if (preparedDraft.kind !== "ready") {
+        if (preparedDraft.reviewId && job.topicCardId) {
+          await this.jobRepository.updateJobReviewLink(job.id, {
+            topicCardId: job.topicCardId,
+            reviewId: preparedDraft.reviewId,
+            leaseOwner
+          });
+        }
         await this.jobRepository.updateJobStatus(job.id, "needs_manual_review", {
           leaseOwner,
           currentStage: "needs_manual_review",
           promptVersionSnapshotJson: promptContext.promptSnapshotJson,
           failureReason: preparedDraft.reason,
-          lastErrorType: "review_block"
-        });
-        logDebugTiming("worker.prepareQueuedJobs", "job_needs_manual_review", {
-          jobId: job.id,
-          accountId: job.accountId,
-          reason: preparedDraft.reason,
-          elapsedMs: getElapsedMs(jobStartedAt)
+          lastErrorType: preparedDraft.kind === "duplicate" ? "duplicate_block" : "review_block"
         });
         return {
           prepared: false,
@@ -643,6 +777,31 @@ export class WorkerRunner {
         };
       }
 
+      if (isAccountQuotaExceeded(error)) {
+        const latestReview = job.topicCardId
+          ? await this.topicRepository.getLatestReviewForTopicCard(job.topicCardId)
+          : null;
+        if (latestReview && job.topicCardId) {
+          await this.jobRepository.updateJobReviewLink(job.id, {
+            topicCardId: job.topicCardId,
+            reviewId: latestReview.id,
+            leaseOwner
+          });
+        }
+        const message = "写作或审核模型额度已耗尽，Dudu API 未能继续；任务已暂停，待额度恢复后从最新审核记录继续。";
+        await this.jobRepository.updateJobStatus(job.id, "needs_manual_review", {
+          leaseOwner,
+          currentStage: "needs_manual_review",
+          failureReason: `${message} ${error instanceof Error ? error.message : String(error)}`,
+          lastErrorType: "review_block"
+        });
+        return {
+          prepared: false,
+          blockedByLogin: false,
+          message
+        };
+      }
+
       logDebugTiming("worker.prepareQueuedJobs", "job_failed", {
         jobId: job.id,
         accountId: job.accountId,
@@ -686,6 +845,82 @@ export class WorkerRunner {
     } finally {
       await this.jobRepository.releaseJobLease(job.id, leaseOwner);
     }
+  }
+
+  private async resumeExistingReview(
+    job: JobListItem,
+    account: WorkerAccount,
+    promptSnapshot: PromptSnapshotMap,
+    accountSoulMarkdown: string | null,
+    onStage: (stage: JobStage) => Promise<void>
+  ): Promise<ResumedDraftResult> {
+    if (!job.topicCardId || !job.reviewId) {
+      return null;
+    }
+
+    const review =
+      (await this.topicRepository.getLatestReviewForTopicCard(job.topicCardId)) ??
+      (await this.topicRepository.getReviewById(job.reviewId));
+    if (!review) {
+      return {
+        kind: "blocked",
+        reason: `任务关联的审核记录 #${job.reviewId} 不存在，已暂停人工确认。`
+      };
+    }
+
+    if (review.review_status === "pass" && review.approved_content) {
+      return {
+        kind: "ready",
+        title: job.title ?? job.questionTitle ?? "",
+        topicCardId: job.topicCardId,
+        reviewId: job.reviewId,
+        approvedContent: review.approved_content,
+        promptVersionSnapshotJson: JSON.stringify(promptSnapshot)
+      };
+    }
+
+    if (!job.questionTitle || !job.questionUrl) {
+      return {
+        kind: "blocked",
+        reason: "任务已有审核关联，但缺少知乎问题信息，已暂停人工确认。"
+      };
+    }
+
+    const editorial = safeParseJson<Record<string, unknown>>(review.editorial_review_json, {});
+    const quality = editorial.quality && typeof editorial.quality === "object"
+      ? (editorial.quality as Record<string, unknown>)
+      : {};
+    const revisionFeedback =
+      (typeof quality.rewriteBrief === "string" && quality.rewriteBrief.trim() ? quality.rewriteBrief : null) ??
+      (typeof editorial.rewrite_brief === "string" && editorial.rewrite_brief.trim() ? editorial.rewrite_brief : null) ??
+      review.review_summary ??
+      "请根据上一轮审核意见做局部改写后重新审核。";
+
+    const rewritten = await this.topicPipelineService.rewriteExistingTopic({
+      publishJobId: job.id,
+      topicCardId: job.topicCardId,
+      candidateTitle: job.questionTitle,
+      questionUrl: job.questionUrl,
+      revisionFeedback,
+      promptVersionSnapshotJson: JSON.stringify(promptSnapshot),
+      accountContext: toAccountPromptContext(account),
+      accountSoulMarkdown,
+      onStage
+    });
+
+    if (!rewritten) {
+      return null;
+    }
+
+    if (rewritten.kind === "ready") {
+      return rewritten;
+    }
+
+    const latestReview = await this.topicRepository.getLatestReviewForTopicCard(job.topicCardId);
+    return {
+      ...rewritten,
+      reviewId: latestReview?.id ?? review.id
+    };
   }
 
   private async processDueJobs(
@@ -752,7 +987,7 @@ export class WorkerRunner {
     return { processedJobs };
   }
 
-  private async executeJob(job: JobListItem, account: WorkerAccount): Promise<TickBranchResult> {
+  private async executeJob(job: JobListItem, account: WorkerAccount, cascadeDepth = 0): Promise<TickBranchResult> {
     const leaseOwner = `worker-${process.pid}-${randomUUID()}`;
     const claimed = await this.jobRepository.claimJob(job.id, leaseOwner, "publish");
     if (!claimed) {
@@ -761,7 +996,7 @@ export class WorkerRunner {
     }
 
     try {
-      return await this.executeClaimedJob(job, account, leaseOwner);
+      return await this.executeClaimedJob(job, account, leaseOwner, cascadeDepth);
     } finally {
       await this.jobRepository.releaseJobLease(job.id, leaseOwner);
     }
@@ -770,7 +1005,8 @@ export class WorkerRunner {
   private async executeClaimedJob(
     job: JobListItem,
     account: WorkerAccount,
-    leaseOwner: string
+    leaseOwner: string,
+    cascadeDepth = 0
   ): Promise<TickBranchResult> {
     let jobDetail = await this.jobRepository.getJobById(job.id);
     const slot = await this.scheduleRepository.getSlotByJobId(job.id);
@@ -895,6 +1131,7 @@ export class WorkerRunner {
       });
 
       let submitClickedAt: string | null = null;
+      let submitState: PublishSubmitState | null = null;
       try {
         const publishResult = await withTimeoutReject(
           this.publishService.runPublishAttempt({
@@ -909,13 +1146,15 @@ export class WorkerRunner {
             resumeAnchor: safeParseJson<PublishResumeAnchor | null>(jobDetail.resumeAnchorJson ?? "", null),
             expectedZhihuUserName: account.zhihuUserName,
             accountName: account.name,
-            onSubmitClicked: async (clickedAt) => {
+            onSubmitClicked: async (clickedAt, state) => {
               submitClickedAt = clickedAt;
+              submitState = state;
               await this.jobRepository.updatePublishAttempt(attemptId, {
                 status: "running",
                 payload: {
                   ...attemptPayload,
-                  submitClickedAt
+                  submitClickedAt,
+                  submitState
                 }
               });
             }
@@ -941,6 +1180,8 @@ export class WorkerRunner {
           promptSnapshotJson: promptContext.promptSnapshotJson,
           attemptPayload: {
             ...attemptPayload,
+            submitClickedAt,
+            submitState,
             finishedAt: new Date().toISOString(),
             pageSnapshot: publishResult.pageSnapshot
           },
@@ -953,12 +1194,18 @@ export class WorkerRunner {
         return { blockedByLogin: false, message: null };
       } catch (error) {
         const failure = normalizePublishError(error);
-        if (submitClickedAt) {
+        if (
+          submitClickedAt &&
+          failure.failureType !== "challenge_required" &&
+          failure.failureType !== "login_required" &&
+          failure.failureType !== "session_expired"
+        ) {
           failure.failureType = "publish_uncertain";
           failure.message = `已点击发布，但在超时前没有完成结果确认（点击时间 ${submitClickedAt}）。先验证现有结果，禁止直接重复发布。`;
           failure.meta = {
             ...failure.meta,
             submitClickedAt,
+            submitState,
             resumeAnchor: {
               stage: "publish_verify",
               currentUrl: failure.currentUrl ?? questionUrl
@@ -972,6 +1219,7 @@ export class WorkerRunner {
           payload: {
             ...attemptPayload,
             submitClickedAt,
+            submitState,
             finishedAt: new Date().toISOString(),
             meta: failure.meta
           },
@@ -984,6 +1232,53 @@ export class WorkerRunner {
           await this.jobRepository.createArtifact(attemptId, "screenshot", screenshotPath, {
             phase: "publish-failure"
           });
+        }
+
+        if (failure.failureType === "question_unavailable") {
+          console.warn(`[worker] Question unavailable for job #${job.id}: ${failure.message}. Fast-forwarding to next question.`);
+
+          await this.failJob(
+            job.id,
+            null,
+            "question_unavailable",
+            failure.message,
+            jobDetail.topicCardId,
+            leaseOwner
+          );
+
+          if (jobDetail.topicCardId) {
+            await this.topicRepository.markCandidateValidityByTopicCard(
+              jobDetail.topicCardId,
+              "invalid",
+              `question_unavailable: ${failure.message}`
+            );
+          }
+
+          await this.publishService.closeSession(sessionKey);
+
+          if (cascadeDepth < 5) {
+            const nextReadyJob = await this.jobRepository.getNextReviewPassedJobForAccount(job.accountId, job.id);
+            if (nextReadyJob) {
+              console.log(
+                `[worker] Found next ready job #${nextReadyJob.id} for account #${job.accountId}, immediately publishing into slot (depth ${cascadeDepth + 1}).`
+              );
+              if (slot) {
+                const nextSlot = await this.scheduleRepository.getSlotByJobId(nextReadyJob.id);
+                await this.scheduleRepository.reassignSlotToNextJob(slot.id, nextReadyJob.id, nextSlot?.id ?? null);
+              }
+              await this.jobRepository.updateScheduledAt(nextReadyJob.id, new Date());
+              return await this.executeJob(nextReadyJob, account, cascadeDepth + 1);
+            }
+          }
+
+          if (slot) {
+            await this.scheduleRepository.updateSlotStatus(slot.id, "failed");
+          }
+
+          return {
+            blockedByLogin: false,
+            message: `知乎题目已失效（404/已删除/已关闭/已锁定），当前无其他就绪回答，已跳过。`
+          };
         }
 
         const recoveredAsPublished = await this.tryFinalizePublishedFromExistingResult({
@@ -1004,6 +1299,19 @@ export class WorkerRunner {
           leaseOwner
         });
         if (recoveredAsPublished) {
+          await this.publishService.closeSession(sessionKey);
+          return { blockedByLogin: false, message: null };
+        }
+
+        if (submitClickedAt && failure.failureType === "publish_uncertain") {
+          await this.failJob(
+            job.id,
+            slot?.id ?? null,
+            "publish_uncertain",
+            `${failure.message}；已完成一次结果核验，禁止再次自动点击发布。`,
+            jobDetail.topicCardId,
+            leaseOwner
+          );
           await this.publishService.closeSession(sessionKey);
           return { blockedByLogin: false, message: null };
         }
@@ -1349,17 +1657,6 @@ export class WorkerRunner {
       return false;
     }
 
-    if (replacement.kind === "blocked") {
-      await this.jobRepository.updateJobStatus(jobId, "needs_manual_review", {
-        leaseOwner,
-        currentStage: "needs_manual_review",
-        promptVersionSnapshotJson: promptSnapshotJson,
-        failureReason: replacement.reason,
-        lastErrorType: "review_block"
-      });
-      return false;
-    }
-
     await this.jobRepository.replaceJobPayload(jobId, {
       topicCardId: replacement.topicCardId,
       reviewId: replacement.reviewId,
@@ -1430,7 +1727,11 @@ export class WorkerRunner {
     });
 
     if (topicCardId) {
-      if (failureType === "network_or_page_error" || failureType === "topic_invalid") {
+      if (
+        failureType === "network_or_page_error" ||
+        failureType === "topic_invalid" ||
+        failureType === "question_unavailable"
+      ) {
         await this.topicRepository.markCandidateValidityByTopicCard(
           topicCardId,
           "invalid",
@@ -1786,7 +2087,8 @@ export class WorkerRunner {
     account?: Pick<WorkerAccount, "id" | "writerPromptVersionId"> | null,
     leaseOwner?: string | null
   ) {
-    if (job.promptVersionSnapshotJson) {
+    const hasStaleRouterPrompt = Boolean(job.promptVersionSnapshotJson && job.promptVersionSnapshotJson.includes("router-list"));
+    if (job.status !== "queued" && job.promptVersionSnapshotJson && !hasStaleRouterPrompt) {
       return {
         promptSnapshotJson: job.promptVersionSnapshotJson,
         promptSnapshot: safeParseJson<PromptSnapshotMap>(job.promptVersionSnapshotJson, {})
@@ -1860,17 +2162,6 @@ export class WorkerRunner {
     });
 
     if (!replacement) {
-      return null;
-    }
-
-    if (replacement.kind === "blocked") {
-      await this.jobRepository.updateJobStatus(jobId, "needs_manual_review", {
-        leaseOwner,
-        currentStage: "needs_manual_review",
-        promptVersionSnapshotJson: promptContext.promptSnapshotJson,
-        failureReason: replacement.reason,
-        lastErrorType: "review_block"
-      });
       return null;
     }
 
@@ -2019,7 +2310,8 @@ function isLlmConnectionError(error: unknown): boolean {
     msg.includes("llm returned an empty stream") ||
     msg.includes("stream was interrupted") ||
     msg.includes("stream_read_error") ||
-    msg.includes("upstream_stream_read_error")
+    msg.includes("upstream_stream_read_error") ||
+    msg.includes("overloaded")
   );
 }
 

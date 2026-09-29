@@ -79,6 +79,18 @@ export class ReviewService {
     const agentContextDocuments =
       hooks?.agentContextDocuments ?? (await this.agentContextService.ensureDocuments());
 
+    const sanitizedPastFingerprints = Array.isArray(input.pastContentFingerprints)
+      ? input.pastContentFingerprints.slice(0, 10).map((item) => {
+          if (!item || typeof item !== "object") return item;
+          const r = item as Record<string, unknown>;
+          return {
+            title: typeof r.title === "string" ? r.title : "",
+            summary: typeof r.summary === "string" ? r.summary.slice(0, 300) : (typeof r.content === "string" ? r.content.slice(0, 300) : ""),
+            fingerprint: r.fingerprint ?? null
+          };
+        })
+      : [];
+
     const combined = await this.llmService.runJsonWithSystemPrompt<CombinedReviewOutput>(
       buildCombinedReviewPrompt(
         reviewPrompt,
@@ -93,14 +105,18 @@ export class ReviewService {
           : null
       ),
       {
-        ...input,
-        softPromoDirective
+        content: input.content,
+        topicSummary: input.topicSummary,
+        softPromoDirective,
+        pastContentFingerprints: sanitizedPastFingerprints
       },
       {
         hardGate: buildHardGateFallback(),
         editorial: buildEditorialFallback(),
         publish: buildPublishFallback(input.content)
-      }
+      },
+      180_000,
+      "review_agent"
     );
 
     await hooks?.onStage?.("review_editorial");
@@ -150,9 +166,20 @@ export class ReviewService {
       publish,
       quality,
       reviewSummary: publish.review_summary ?? quality.rewriteBrief ?? editorial.rewrite_brief ?? hardGate.reason ?? "",
-      approvedContent: finalDecision === "PASS" ? publish.approved_content ?? input.content : null
+      approvedContent:
+        finalDecision === "PASS"
+          ? (publish.approved_content ?? input.content)
+          : null
     };
   }
+}
+
+export function stripForcedReferences(text: string | null | undefined): string {
+  if (!text) return "";
+  let cleaned = text;
+  cleaned = cleaned.replace(/(?:^|\n+)(?:[#*_\s]*参考文献[#*_\s]*[\r\n]+)?(?:[^\n]*?(?:费率|接入步骤|仓库|脚本|router-list|整理|备忘|对照)[^\n]*?[\r\n]+)?https?:\/\/github\.com\/[^\s\)\>\]]+/gi, "");
+  cleaned = cleaned.replace(/(?:^|\n+)[#*_\s]*参考文献[#*_\s]*(?:\n|$)/gi, "\n");
+  return cleaned.trim();
 }
 
 function buildCombinedReviewPrompt(
@@ -354,7 +381,7 @@ function buildReviewSoftPromoPromptSuffix(directive?: SoftPromoReviewDirective) 
       "2. 选题 Agent 标记 include_soft_promo=true，所以要检查草稿有没有把 Dudu 中转站自然放进具体、不夸大的位置。",
       "3. 如果完全没有 Dudu 中转站或短称 Dudu，editorial.decision 通常应为 REVISE，并在 rewrite_brief 里简洁要求写作 Agent 在选定的产品承接点自然补上。",
       "4. 如果出现了产品名，但读起来像硬广、功能清单、保证话术或无关插入，要求修改。",
-      "5. 正文出现 api.dududu.cloud 或 dududu.cloud 时，hardGate 必须 BLOCK。提到 Dudu 时，必须有一句 **加粗** 引导点名文末 GitHub 仓库 「router-list」 并写清打开后看什么；文末「参考文献」只放 https://github.com/hehesama527/router-list ，链接上方要有加粗说明。缺少引导或引导未加粗时要求 REVISE。这段参考文献不算结尾硬广。",
+      "5. 正文出现 api.dududu.cloud 或 dududu.cloud 时，hardGate 必须 BLOCK。提到 Dudu 时，以技术答主随手分享的口吻自然讨论即可。严禁出现「参考文献」等伪标题，严禁大块加粗框线。文末不得强制添加参考文献或特定外链。",
       `6. 选题原因：${resolved.reason || "未提供"}`,
       resolved.productAnchor ? `7. 产品承接点：${resolved.productAnchor}` : null,
       resolved.writerInstruction ? `8. 给写作 Agent 的指令：${resolved.writerInstruction}` : null
@@ -543,7 +570,7 @@ function applyForbiddenRelayDomainHardGate(
     decision: "BLOCK",
     issues: [
       ...hardGate.issues.filter((item) => !/dududu\.cloud/i.test(item)),
-      "正文出现了禁止直写的 API 域名 dududu.cloud。需要给去处时只用文末参考文献 https://github.com/hehesama527/router-list 。"
+      "正文出现了禁止直写的 API 域名 dududu.cloud。不要在正文中暴露 API 域名。"
     ],
     reason: "正文出现了禁止直写的 API 域名。"
   };
@@ -568,9 +595,9 @@ function normalizePublish(value: Partial<ReviewStageResult> | null | undefined, 
 
   const approvedContent =
     normalizedDecision === "PASS" && typeof value?.approved_content === "string" && value.approved_content.trim()
-      ? value.approved_content
+      ? stripForcedReferences(value.approved_content)
       : normalizedDecision === "PASS"
-        ? content
+        ? stripForcedReferences(content)
         : "";
 
   return {

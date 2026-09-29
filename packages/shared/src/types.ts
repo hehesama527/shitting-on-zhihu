@@ -894,6 +894,7 @@ export type FailureType =
   | "topic_invalid"
   | "review_block"
   | "llm_connection_error"
+  | "question_unavailable"
   | "unknown_failure";
 
 export type RecoveryAction =
@@ -1443,6 +1444,27 @@ export type DashboardSummary = {
     failedJobs: number;
     readyToPublishJobs: number;
   };
+};
+
+export type ZhihuEngagementComment = {
+  commentId: string;
+  authorName: string | null;
+  content: string;
+  createdAt: string | null;
+};
+
+export type ZhihuEngagementSnapshot = {
+  id: number;
+  jobId: number;
+  accountId: number;
+  title: string | null;
+  postUrl: string;
+  voteCount: number;
+  commentCount: number;
+  comments: ZhihuEngagementComment[];
+  collectedAt: string;
+  status: "succeeded" | "failed";
+  errorMessage: string | null;
 };
 
 export type WorkerTickSummary = {

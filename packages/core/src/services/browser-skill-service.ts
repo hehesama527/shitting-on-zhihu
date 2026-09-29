@@ -9,6 +9,9 @@ type ClickInput = {
   roles?: Array<"button" | "link">;
   selectors?: string[];
   exact?: boolean;
+  scopeSelectors?: string[];
+  strict?: boolean;
+  allowForce?: boolean;
 };
 
 type FocusInput = {

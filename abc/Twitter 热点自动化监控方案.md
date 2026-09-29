@@ -44,7 +44,7 @@
 
 **实现方式：** Python 脚本 + Binance 公开 API + 飞书 webhook
 
-**脚本位置：** `C:\Users\Mayn\.openclaw\workspace-erniu\scripts\binance_monitor.py`
+**脚本位置：** `C:\Users\your_user\.openclaw\workspace-erniu\scripts\binance_monitor.py`
 
 **运行频率：** 每 5 分钟
 
@@ -60,7 +60,7 @@
 
 **实现方式：** Python 脚本 + RSS 解析 + 飞书 webhook
 
-**脚本位置：** `C:\Users\Mayn\.openclaw\workspace-erniu\scripts\news_monitor.py`
+**脚本位置：** `C:\Users\your_user\.openclaw\workspace-erniu\scripts\news_monitor.py`
 
 **运行频率：** 每 10 分钟
 
@@ -110,7 +110,7 @@ from datetime import datetime
 
 # ========== 配置区 ==========
 # 飞书 webhook 地址（替换成你自己的）
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_KEY"
+FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/your_webhook_token_WEBHOOK_KEY"
 
 # 监控币种及阈值
 MONITOR_SYMBOLS = {
@@ -264,7 +264,7 @@ from datetime import datetime
 
 # ========== 配置区 ==========
 # 飞书 webhook 地址（替换成你自己的）
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK_KEY"
+FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/your_webhook_token_WEBHOOK_KEY"
 
 # 律动 RSS 地址
 RSS_URL = "https://www.theblockbeats.info/rss"

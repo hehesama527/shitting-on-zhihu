@@ -212,13 +212,17 @@ def understand_publish_page(data: PageSnapshotInput):
         raise HTTPException(status_code=503, detail="Laya model not initialized")
 
     # Fast heuristic check on explicit buttons
-    has_submit = any(sub in b for b in data.buttons for sub in ["发布回答", "提交回答", "发布修改", "保存修改"])
+    has_submit = any(sub in b for b in data.buttons for sub in ["发布回答", "提交回答", "提交修改", "更新回答", "发布修改", "保存修改"])
     has_editor = data.editorContent is not None or any(k in " ".join(data.visibleTexts) for k in ["DraftEditor", "撤销", "清除格式"])
     has_view_my_answer = any("查看我的回答" in b for b in data.buttons)
     has_write_or_edit = any(sub in b for b in data.buttons for sub in ["写回答", "编辑回答", "继续写"])
 
     if has_submit:
-        target = [b for b in data.buttons if any(k in b for k in ["发布回答", "提交回答", "发布修改", "保存修改"])][:1]
+        target = [
+            b
+            for b in data.buttons
+            if any(k in b for k in ["发布回答", "提交回答", "提交修改", "更新回答", "发布修改", "保存修改"])
+        ][:1]
         return UnderstandPageResponse(
             nextAction="CLICK_SUBMIT",
             targetTexts=target if target else ["发布回答"],
@@ -305,7 +309,7 @@ def review_publish_result(data: ReviewPublishInput):
     # Fast heuristics
     is_answer = "/answer/" in data.currentUrl
     has_signals = len(data.matchedSignals) > 0
-    any_text = " ".join(data.visibleTexts).lower()
+    any_text = " ".join(data.visibleTexts + data.matchedSignals + [data.title]).lower()
 
     # 1. 如果已经跳转到回答详情页，且编辑器已关闭，直接确认发布成功 (避免误伤知乎侧边栏的“违法和不良信息举报”等通用文字)
     if is_answer and not data.editorStillVisible:
@@ -317,7 +321,7 @@ def review_publish_result(data: ReviewPublishInput):
         )
     
     # 2. 如果还在编辑态且弹出了明确的违规提示
-    if data.editorStillVisible and any(k in any_text for k in ["不符合社区规范", "包含敏感词汇", "内容未通过审核", "发布失败：包含敏感"]):
+    if any(k in any_text for k in ["内容违规", "违规", "不符合社区规范", "包含敏感词汇", "内容未通过审核", "发布失败：包含敏感", "发布失败", "审核不通过"]):
         return ReviewPublishResponse(
             decision="CONTENT_RISK",
             confidence="high",

@@ -38,6 +38,8 @@ import {
   VideoService,
   VideoWorkerRunner,
   ZhihuNoteAgentService,
+  ZhihuDataAgentService,
+  ZhihuEngagementRepository,
   applySchemaMigrations,
   getAppConfig,
   getMysqlPool,
@@ -102,6 +104,8 @@ const topicPipelineService = new TopicPipelineService(
 );
 const runtime = new PlaywrightToolRuntime(jobRepository);
 const browserSkillService = new BrowserSkillService(runtime, jobRepository);
+const zhihuEngagementRepository = new ZhihuEngagementRepository(pool);
+const zhihuDataAgentService = new ZhihuDataAgentService(zhihuEngagementRepository, browserSkillService);
 const sessionService = new SessionService(browserSkillService, llmService, layaService);
 const topicDiscoveryService = new TopicDiscoveryService(topicRepository, browserSkillService, sessionService, llmService, layaService);
 const publishService = new PublishService(llmService, browserSkillService, sessionService, layaService);
@@ -520,6 +524,22 @@ app.get("/jobs/:id", async (request) => {
   };
 });
 
+app.get("/zhihu/data-agent/snapshots", async (request) => {
+  const query = request.query as { accountId?: string };
+  const accountId = query.accountId ? Number(query.accountId) : null;
+  return { snapshots: await zhihuEngagementRepository.listSnapshots(Number.isInteger(accountId) ? accountId : null) };
+});
+
+app.post("/jobs/:id/data-agent/collect", async (request) => {
+  const params = request.params as { id: string };
+  const jobId = Number(params.id);
+  const job = await jobRepository.getJobById(jobId);
+  if (!job) throw new Error("任务不存在。");
+  const account = await accountRepository.getAccount(job.accountId);
+  if (!account) throw new Error("任务所属账号不存在。");
+  return { snapshot: await zhihuDataAgentService.collect({ job, account }) };
+});
+
 app.get("/jobs/:id/publish-attempts", async (request) => {
   const params = request.params as { id: string };
   return {
@@ -650,10 +670,6 @@ app.post("/jobs/:id/reselect-topic", async (request) => {
 
   if (!replacement) {
     throw new Error("当前没有新的可替换选题。");
-  }
-
-  if (replacement.kind !== "ready") {
-    throw new Error(replacement.reason || "Replacement topic did not produce a publishable draft.");
   }
 
   await jobRepository.replaceJobPayload(jobId, {

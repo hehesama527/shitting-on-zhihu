@@ -1,5 +1,10 @@
 import type { FailureType, PromptSnapshotMap, PublishStepAction, PublishStepPlan } from "@zhihu-mvp/shared";
 import { normalizeZhihuQuestionUrl } from "../utils/zhihu-url.js";
+import {
+  findZhihuPublishLabel,
+  normalizeZhihuPublishLabel,
+  ZHIHU_PUBLISH_LABELS
+} from "../utils/zhihu-publish-targets.js";
 import { LlmService } from "./llm-service.js";
 import { BrowserSkillService, type BrowserSkillContext, type PageSnapshot } from "./browser-skill-service.js";
 import { SessionService } from "./session-service.js";
@@ -12,35 +17,13 @@ const EDITOR_SELECTORS = [
   "[contenteditable='true']"
 ];
 
-const SUBMIT_TEXT_CANDIDATES = ["发布回答", "提交回答", "更新回答", "保存修改", "发布修改"];
-const DIRECT_SUBMIT_SELECTORS = [
-  "button:has-text('发布回答')",
-  "button:has-text('提交回答')",
-  "button:has-text('更新回答')",
-  "button:has-text('保存修改')",
-  "button:has-text('发布修改')",
-  ".PublishPanel button:has-text('发布')",
-  ".PublishPanel-btnGroup button",
-  ".AnswerForm button:has-text('发布回答')",
-  ".AnswerForm button:has-text('提交回答')",
-  ".AnswerForm button:has-text('更新回答')",
-  ".AnswerForm button:has-text('保存修改')",
-  ".AnswerForm button:has-text('发布修改')",
-  ".AnswerForm [role='button']:has-text('发布回答')",
-  ".AnswerForm [role='button']:has-text('提交回答')",
-  ".AnswerForm [role='button']:has-text('更新回答')",
-  ".AnswerForm [role='button']:has-text('保存修改')",
-  ".AnswerForm [role='button']:has-text('发布修改')",
-  "[class*='AnswerForm'] button:has-text('发布回答')",
-  "[class*='AnswerForm'] button:has-text('提交回答')",
-  "[class*='AnswerForm'] button:has-text('更新回答')",
-  "[class*='AnswerForm'] button:has-text('保存修改')",
-  "[class*='AnswerForm'] button:has-text('发布修改')",
-  "[class*='AnswerForm'] [role='button']:has-text('发布回答')",
-  "[class*='AnswerForm'] [role='button']:has-text('提交回答')",
-  "[class*='AnswerForm'] [role='button']:has-text('更新回答')",
-  "[class*='AnswerForm'] [role='button']:has-text('保存修改')",
-  "[class*='AnswerForm'] [role='button']:has-text('发布修改')"
+const SUBMIT_SURFACE_SELECTORS = [
+  ".PublishPanel",
+  ".AnswerForm",
+  "[class*='PublishPanel']",
+  "[class*='AnswerForm']",
+  "main:has([contenteditable='true'])",
+  "main:has([role='textbox'])"
 ];
 
 type PublishResultReview = {
@@ -84,6 +67,8 @@ type EditorFormatComparison = {
   reason: string;
 };
 
+export type PublishSubmitState = "READY_TO_SUBMIT" | "SUBMITTING" | "SUBMIT_CONFIRMED" | "RESULT_UNCERTAIN";
+
 export type PublishResumeAnchor = {
   stage: string;
   currentUrl?: string | null;
@@ -120,7 +105,7 @@ export class PublishService {
     resumeAnchor?: PublishResumeAnchor | null;
     expectedZhihuUserName?: string | null;
     accountName?: string | null;
-    onSubmitClicked?: (clickedAt: string) => Promise<void> | void;
+    onSubmitClicked?: (clickedAt: string, state: PublishSubmitState) => Promise<void> | void;
   }) {
     const traceBase = {
       sessionKey: input.sessionKey,
@@ -156,6 +141,14 @@ export class PublishService {
       }
     );
 
+    await this.browserSkillService.wait(
+      {
+        ...traceBase,
+        stage: "publishing"
+      },
+      { ms: 2500 }
+    );
+
     const openSnapshot = await this.browserSkillService.snapshot({
       ...traceBase,
       stage: "login_checking"
@@ -169,6 +162,14 @@ export class PublishService {
           stage: "login_checking",
           currentUrl: openSnapshot.url
         }
+      });
+    }
+
+    const questionLiveness = detectQuestionLiveness(openSnapshot);
+    if (!questionLiveness.alive) {
+      throw new PublishFlowError("question_unavailable", questionLiveness.reason, openSnapshot.url, {
+        snapshot: openSnapshot,
+        questionLiveness
       });
     }
 
@@ -257,30 +258,9 @@ export class PublishService {
         }
       });
     } else if (openPlan.nextAction === "CLICK_WRITE_ANSWER") {
-      await this.clickPlanOrThrow({
-        traceBase,
-        snapshot: openPlanState.snapshot,
-        plan: openPlan,
-        failureType: "editor_not_ready",
-        errorMessage: "没有找到“写回答”入口。"
-      });
-
-      await this.browserSkillService.wait(
-        {
-          ...traceBase,
-          stage: "publishing"
-        },
-        {
-          ms: 2500
-        }
-      );
-
       rawEditorSnapshot = await this.ensureEditorSurface({
         traceBase,
-        snapshot: await this.browserSkillService.snapshot({
-          ...traceBase,
-          stage: "publishing"
-        }),
+        snapshot: openPlanState.snapshot,
         promptSnapshot: input.promptSnapshot
       });
     } else if (openPlan.nextAction !== "FOCUS_EDITOR" && openPlan.nextAction !== "PASTE_CONTENT") {
@@ -414,6 +394,19 @@ export class PublishService {
       );
     }
 
+    // 拟人化审阅与停留模拟：根据字数动态停留 35~60 秒并伴随轻微滚动，消除瞬时 0 毫秒提交的客户端风控硬特征
+    const dwellSeconds = Math.floor(Math.random() * 25) + 35;
+    console.log(`[PublishService] 模拟真人答主检查排版与预览，停留审阅 ${dwellSeconds} 秒...`);
+    try {
+      await this.browserSkillService.wait({ ...traceBase, stage: "publishing" }, { ms: Math.floor(dwellSeconds * 400) });
+      await this.browserSkillService.scroll({ ...traceBase, stage: "publishing" }, { amount: 350 });
+      await this.browserSkillService.wait({ ...traceBase, stage: "publishing" }, { ms: Math.floor(dwellSeconds * 400) });
+      await this.browserSkillService.scroll({ ...traceBase, stage: "publishing" }, { amount: 600 });
+      await this.browserSkillService.wait({ ...traceBase, stage: "publishing" }, { ms: Math.floor(dwellSeconds * 200) });
+    } catch (scrollErr) {
+      console.warn(`[PublishService] 拟人化滚动偶发异常（已忽略并继续）：${scrollErr}`);
+    }
+
     return this.submitWithRecovery({
       traceBase,
       snapshot: afterPasteSnapshot,
@@ -440,7 +433,7 @@ export class PublishService {
     snapshot: PageSnapshot;
     content: string;
     promptSnapshot?: PromptSnapshotMap | null;
-    onSubmitClicked?: (clickedAt: string) => Promise<void> | void;
+    onSubmitClicked?: (clickedAt: string, state: PublishSubmitState) => Promise<void> | void;
   }) {
     let snapshot = input.snapshot;
     let lastPlan: PublishStepPlan | null = null;
@@ -478,23 +471,39 @@ export class PublishService {
       if (clicked) {
         const clickedAt = new Date().toISOString();
         try {
-          await input.onSubmitClicked?.(clickedAt);
+          await input.onSubmitClicked?.(clickedAt, "SUBMITTING");
         } catch (error) {
           console.warn("[PublishService] failed to persist submit-click marker", error);
         }
         recoveryTrace.push(`step_${step}:click_submit`);
-        await this.browserSkillService.wait({ ...input.traceBase, stage: "publish_verify" }, { ms: 3500 });
         try {
-          return await this.collectVerifiedPublishResult(input.traceBase, input.traceBase.publishJobId, input.content, input.promptSnapshot);
+          const result = await this.waitForPublishResult({
+            traceBase: input.traceBase,
+            content: input.content,
+            promptSnapshot: input.promptSnapshot,
+            recoveryTrace
+          });
+          try {
+            await input.onSubmitClicked?.(clickedAt, "SUBMIT_CONFIRMED");
+          } catch (error) {
+            console.warn("[PublishService] failed to persist publish-confirmed marker", error);
+          }
+          return result;
         } catch (error) {
           if (!(error instanceof PublishFlowError) || error.failureType !== "publish_uncertain") {
             throw error;
           }
-          recoveryTrace.push(`step_${step}:verify_uncertain`);
-          snapshot = await this.browserSkillService.snapshot({ ...input.traceBase, stage: "publish_verify" });
-          if (isTerminalPublishState(snapshot)) {
-            throw error;
+          try {
+            await input.onSubmitClicked?.(clickedAt, "RESULT_UNCERTAIN");
+          } catch (markerError) {
+            console.warn("[PublishService] failed to persist uncertain-result marker", markerError);
           }
+          throw new PublishFlowError("publish_uncertain", error.message, error.currentUrl, {
+            ...error.meta,
+            submitClickedAt: clickedAt,
+            submitState: "RESULT_UNCERTAIN",
+            recoveryTrace
+          });
         }
       } else {
         recoveryTrace.push(`step_${step}:submit_target_missing`);
@@ -555,6 +564,55 @@ export class PublishService {
     });
   }
 
+  private async waitForPublishResult(input: {
+    traceBase: {
+      sessionKey: string;
+      profileDir: string;
+      publishJobId: number;
+      publishAttemptId: number | null;
+      traceGroupId: string;
+      agentName: "publish_agent";
+    };
+    content: string;
+    promptSnapshot?: PromptSnapshotMap | null;
+    recoveryTrace: string[];
+  }) {
+    const deadline = Date.now() + 15_000;
+    let lastSnapshot: PageSnapshot | null = null;
+
+    while (Date.now() < deadline) {
+      await this.browserSkillService.wait({ ...input.traceBase, stage: "publish_verify" }, { ms: 700 });
+      lastSnapshot = await this.browserSkillService.snapshot({
+        ...input.traceBase,
+        stage: "publish_verify"
+      });
+
+      if (isManualGateState(lastSnapshot)) {
+        throw new PublishFlowError("challenge_required", "提交后页面出现登录、安全验证或验证码，需要人工处理。", lastSnapshot.url, {
+          snapshot: lastSnapshot,
+          recoveryTrace: input.recoveryTrace,
+          resumeAnchor: {
+            stage: "publish_verify",
+            currentUrl: lastSnapshot.url
+          }
+        });
+      }
+
+      if (hasPublishedAnswerSemantic(lastSnapshot) || isAnswerDetailUrl(lastSnapshot.url)) {
+        input.recoveryTrace.push("poll:published-semantic");
+        break;
+      }
+    }
+
+    input.recoveryTrace.push(lastSnapshot ? "poll:final-review" : "poll:no-snapshot");
+    return this.collectVerifiedPublishResult(
+      input.traceBase,
+      input.traceBase.publishJobId,
+      input.content,
+      input.promptSnapshot
+    );
+  }
+
   private async trySubmitClick(
     traceBase: {
       sessionKey: string;
@@ -567,19 +625,21 @@ export class PublishService {
     plan: PublishStepPlan
   ) {
     const names = sanitizeSubmitTargets(plan.targetTexts);
-    const targetNames = names.length ? names : SUBMIT_TEXT_CANDIDATES;
+    const targetNames = names.length ? names : [...ZHIHU_PUBLISH_LABELS.submit];
     try {
       await this.browserSkillService.click(
         { ...traceBase, stage: "publishing" },
         {
           names: targetNames,
           roles: plan.targetRoles.length ? plan.targetRoles : ["button", "link"],
-          selectors: mergeSelectors(plan.targetSelectors, DIRECT_SUBMIT_SELECTORS)
+          scopeSelectors: SUBMIT_SURFACE_SELECTORS,
+          strict: true,
+          allowForce: false
         }
       );
       return true;
     } catch {
-      return this.tryDirectSubmitClick(traceBase);
+      return false;
     }
   }
 
@@ -728,6 +788,12 @@ export class PublishService {
       currentUrl: string;
       screenshotPath: string;
     } | null = null;
+    let bestResult: {
+      reviewedResult: { decision: "SUCCESS" | "CONTENT_RISK" | "UNCERTAIN"; reason: string };
+      currentUrl: string;
+      screenshotPath: string;
+    } | null = null;
+    let bestResultScore = -1;
 
     for (const candidateUrl of candidateUrls) {
       try {
@@ -758,10 +824,36 @@ export class PublishService {
           promptSnapshot: input.promptSnapshot,
           screenshotLabel: `publish-verify-${input.publishJobId}`
         });
-        lastResult = reviewedPage;
+        const isPrimaryCandidate = candidateUrl === input.currentUrl || candidateUrl === input.questionUrl;
+        const normalizedDecision =
+          reviewedPage.reviewedResult.decision === "CONTENT_RISK" && !isPrimaryCandidate
+            ? "UNCERTAIN"
+            : reviewedPage.reviewedResult.decision;
+        const normalizedPage = {
+          ...reviewedPage,
+          reviewedResult: {
+            ...reviewedPage.reviewedResult,
+            decision: normalizedDecision
+          }
+        };
+        lastResult = normalizedPage;
 
-        if (reviewedPage.reviewedResult.decision === "SUCCESS" || reviewedPage.reviewedResult.decision === "CONTENT_RISK") {
-          break;
+        if (normalizedDecision === "SUCCESS") {
+          return {
+            ok: true,
+            reason: normalizedPage.reviewedResult.reason,
+            finalUrl: normalizedPage.currentUrl,
+            screenshotPath: normalizedPage.screenshotPath
+          };
+        }
+
+        const resultScore =
+          (normalizedDecision === "CONTENT_RISK" ? 20 : 10) +
+          (isPrimaryCandidate ? 2 : 0) +
+          (isAnswerDetailUrl(normalizedPage.currentUrl) ? 2 : 0);
+        if (resultScore > bestResultScore) {
+          bestResult = normalizedPage;
+          bestResultScore = resultScore;
         }
       } catch (error) {
         lastResult = {
@@ -775,11 +867,12 @@ export class PublishService {
       }
     }
 
+    const result = bestResult ?? lastResult;
     return {
-      ok: lastResult?.reviewedResult.decision === "SUCCESS",
-      reason: lastResult?.reviewedResult.reason ?? "没有可用的发布结果验证入口。",
-      finalUrl: lastResult?.currentUrl ?? input.currentUrl,
-      screenshotPath: lastResult?.screenshotPath ?? ""
+      ok: result?.reviewedResult.decision === "SUCCESS",
+      reason: result?.reviewedResult.reason ?? "没有可用的发布结果验证入口。",
+      finalUrl: result?.currentUrl ?? input.currentUrl,
+      screenshotPath: result?.screenshotPath ?? ""
     };
   }
 
@@ -941,95 +1034,25 @@ export class PublishService {
     return { snapshot, plan };
   }
 
-  private async understandPublishPage(snapshot: PageSnapshot, promptSnapshot?: PromptSnapshotMap | null): Promise<PublishStepPlan> {
-    // 优先尝试本地 Laya 决策加速 (25ms)
-    try {
-      const layaPlan = await this.layaService.understandPublishPage(snapshot);
-      if (layaPlan && layaPlan.nextAction !== "WAIT") {
-        if (layaPlan.nextAction === "CLICK_WRITE_ANSWER" && (!layaPlan.targetSelectors || layaPlan.targetSelectors.length === 0)) {
-          layaPlan.targetSelectors = [
-            "button:has-text('编辑回答')",
-            "button:has-text('写回答')",
-            "button.WriteAnswerButton",
-            ".QuestionHeaderActions button:has-text('编辑回答')",
-            ".QuestionHeaderActions button:has-text('写回答')",
-            ".QuestionHeaderActions button.WriteAnswerButton"
-          ];
-        }
-        if ((layaPlan.nextAction === "FOCUS_EDITOR" || layaPlan.nextAction === "PASTE_CONTENT") && (!layaPlan.targetSelectors || layaPlan.targetSelectors.length === 0)) {
-          layaPlan.targetSelectors = EDITOR_SELECTORS;
-        }
-        return layaPlan;
-      }
-    } catch {
-      // 异常自动平滑降级至下方的 LLM 兜底
-    }
+  private async understandPublishPage(snapshot: PageSnapshot, _promptSnapshot?: PromptSnapshotMap | null): Promise<PublishStepPlan> {
+    const deterministicPlan = buildFallbackPublishPlan(snapshot, [
+      "VERIFY_RESULT",
+      "CLICK_WRITE_ANSWER",
+      "FOCUS_EDITOR",
+      "PASTE_CONTENT",
+      "CLICK_SUBMIT"
+    ]);
 
-    const publishPrompt = await this.llmService.resolvePrompt("publish_agent", {
-      promptSnapshot
-    });
-
-    const result = await this.llmService.runJsonWithSystemPrompt<PublishStepPlan>(
-      `${publishPrompt}
-
-补充说明：
-你现在执行的是 Publish Agent 的“发布页理解任务”。
-任务目标：
-根据当前知乎页面快照，判断发布流程下一步最合理的动作。
-
-可选 nextAction 只有：
-1. CLICK_WRITE_ANSWER
-2. FOCUS_EDITOR
-3. PASTE_CONTENT
-4. CLICK_SUBMIT
-5. WAIT
-6. VERIFY_RESULT
-7. REQUEST_MANUAL_LOGIN
-
-判断规则：
-1. 如果页面出现登录、挑战、风控、安全验证、人机验证，输出 REQUEST_MANUAL_LOGIN。
-2. 先看 snapshot.buttons 和 snapshot.links。当前是问题页，且其中出现「写回答」（允许前面有零宽字符或空白），必须输出 CLICK_WRITE_ANSWER。这是默认路径。
-3. 不要因为 visibleTexts、标题、评论、侧栏里出现「我的回答」「查看我的回答」就输出 VERIFY_RESULT。那不是本账号已经回答过的证据。
-4. 只有 buttons 或 links 上的可点击文案就是「查看我的回答」或「编辑回答」，或当前 URL 已是 /question/.../answer/... 时，才输出 VERIFY_RESULT。
-5. 不要选择「邀请回答」。
-6. 已经进入回答编辑态时，输出 FOCUS_EDITOR 或 PASTE_CONTENT。
-7. 编辑态下能识别到「发布回答」时，输出 CLICK_SUBMIT。
-8. targetTexts 必须从 snapshot.buttons 或 snapshot.links 原样复制，保留零宽字符，不要改写成干净文案。targetRoles 只允许 button 或 link。
-9. 证据不足时才输出 WAIT。
-10. 只输出 JSON，不要解释，不要 Markdown。
-
-输出格式：
-{
-  "nextAction": "CLICK_WRITE_ANSWER | FOCUS_EDITOR | PASTE_CONTENT | CLICK_SUBMIT | WAIT | VERIFY_RESULT | REQUEST_MANUAL_LOGIN",
-  "targetTexts": ["写回答"],
-  "targetRoles": ["button"],
-  "targetSelectors": [],
-  "confidence": "high | medium | low",
-  "reason": "一句话说明原因"
-}`,
-      snapshot,
-      {
+    return (
+      deterministicPlan ?? {
         nextAction: "WAIT",
         targetTexts: [],
         targetRoles: [],
         targetSelectors: [],
         confidence: "low",
-        reason: ""
+        reason: "页面没有出现明确的知乎发布动作入口，等待下一次 DOM 快照。"
       }
     );
-
-    return {
-      nextAction: result.nextAction ?? "WAIT",
-      targetTexts: Array.isArray(result.targetTexts) ? result.targetTexts.map((item: unknown) => String(item)) : [],
-      targetRoles: Array.isArray(result.targetRoles)
-        ? result.targetRoles.filter((item: unknown): item is "button" | "link" => item === "button" || item === "link")
-        : [],
-      targetSelectors: Array.isArray(result.targetSelectors)
-        ? result.targetSelectors.map((item: unknown) => String(item))
-        : [],
-      confidence: result.confidence === "high" || result.confidence === "medium" ? result.confidence : "low",
-      reason: typeof result.reason === "string" ? result.reason : ""
-    };
   }
 
   private async reviewPublishResult(
@@ -1038,6 +1061,15 @@ export class PublishService {
     content: string,
     promptSnapshot?: PromptSnapshotMap | null
   ) {
+    if (isLikelyUnavailablePage(snapshot)) {
+      return {
+        decision: "UNCERTAIN" as const,
+        confidence: "low" as const,
+        matchedSignals: [],
+        reason: "验证入口返回了 404 或页面不存在，不能据此判定内容风险或发布失败。"
+      };
+    }
+
     const contentSignals = buildPublishContentSignals(content);
     const initialMatchedSignals = findMatchedExpectedSignals(snapshot, contentSignals.expectedSignals);
     const initialEditorStillVisible = hasEditorSemantic(snapshot);
@@ -1390,6 +1422,13 @@ export class PublishService {
             await this.browserSkillService.open({ ...input.traceBase, stage: "publishing" }, { url: writeUrl });
             await this.browserSkillService.wait({ ...input.traceBase, stage: "publishing" }, { ms: 2500 });
             snapshot = await this.browserSkillService.snapshot({ ...input.traceBase, stage: "publishing" });
+            const writeLiveness = detectQuestionLiveness(snapshot);
+            if (!writeLiveness.alive) {
+              throw new PublishFlowError("question_unavailable", writeLiveness.reason, snapshot.url, {
+                snapshot,
+                questionLiveness: writeLiveness
+              });
+            }
             if (hasEditorSemantic(snapshot) || hasSubmitSemantic(snapshot) || snapshot.url.includes("/signin")) {
               return snapshot;
             }
@@ -1416,6 +1455,14 @@ export class PublishService {
       if (hasEditorSemantic(snapshot) || hasSubmitSemantic(snapshot) || snapshot.url.includes("/signin")) {
         return snapshot;
       }
+    }
+
+    const finalLiveness = detectQuestionLiveness(snapshot);
+    if (!finalLiveness.alive) {
+      throw new PublishFlowError("question_unavailable", finalLiveness.reason, snapshot.url, {
+        snapshot,
+        questionLiveness: finalLiveness
+      });
     }
 
     return snapshot;
@@ -1555,31 +1602,6 @@ export class PublishService {
     }
   }
 
-  private async tryDirectSubmitClick(traceBase: {
-    sessionKey: string;
-    profileDir: string;
-    publishJobId: number;
-    publishAttemptId: number | null;
-    traceGroupId: string;
-    agentName: "publish_agent";
-  }) {
-    try {
-      await this.browserSkillService.click(
-        {
-          ...traceBase,
-          stage: "publishing"
-        },
-        {
-          names: SUBMIT_TEXT_CANDIDATES,
-          roles: ["button", "link"],
-          selectors: DIRECT_SUBMIT_SELECTORS
-        }
-      );
-      return true;
-    } catch {
-      return false;
-    }
-  }
 }
 
 function mergeSelectors(primary: string[], fallback: string[]) {
@@ -1595,22 +1617,13 @@ function isManualGateState(snapshot: PageSnapshot) {
   );
 }
 
-function isTerminalPublishState(snapshot: PageSnapshot) {
-  return isManualGateState(snapshot) || /风控|违规|风险提示|内容审核/.test([snapshot.title, ...snapshot.visibleTexts].join(" "));
-}
-
 function buildFallbackPublishPlan(snapshot: PageSnapshot, expectedActions: PublishStepAction[]): PublishStepPlan | null {
-  const combinedTexts = [
-    snapshot.title,
-    ...snapshot.visibleTexts,
-    ...snapshot.buttons,
-    ...snapshot.links.map((item) => item.text)
-  ]
-    .map((item) => item.trim())
-    .filter(Boolean);
+  const buttonTexts = snapshot.buttons.map((item) => item.trim()).filter(Boolean);
+  const linkTexts = snapshot.links.map((item) => item.text.trim()).filter(Boolean);
+  const actionTexts = [...buttonTexts, ...linkTexts];
 
   if (expectedActions.includes("VERIFY_RESULT")) {
-    const existingAnswerText = findFirstMatchingText(combinedTexts, ["查看我的回答", "我的回答"]);
+    const existingAnswerText = findZhihuPublishLabel(actionTexts, "view");
     if (existingAnswerText) {
       return {
         nextAction: "VERIFY_RESULT",
@@ -1621,10 +1634,21 @@ function buildFallbackPublishPlan(snapshot: PageSnapshot, expectedActions: Publi
         reason: "页面已经出现当前账号的回答语义，先按已回答状态核验结果。"
       };
     }
+
+    if (isAnswerDetailUrl(snapshot.url)) {
+      return {
+        nextAction: "VERIFY_RESULT",
+        targetTexts: [],
+        targetRoles: [],
+        targetSelectors: [],
+        confidence: "high",
+        reason: "当前 URL 已经是回答详情页，直接核验本次发布结果。"
+      };
+    }
   }
 
   if (expectedActions.includes("CLICK_WRITE_ANSWER")) {
-    const writeAnswerText = findFirstMatchingText(combinedTexts, ["写回答", "编辑回答", "继续写"]);
+    const writeAnswerText = findZhihuPublishLabel(actionTexts, "write");
     if (writeAnswerText && !hasEditorSemantic(snapshot) && !hasSubmitSemantic(snapshot)) {
       return {
         nextAction: "CLICK_WRITE_ANSWER",
@@ -1656,7 +1680,7 @@ function buildFallbackPublishPlan(snapshot: PageSnapshot, expectedActions: Publi
   }
 
   if (expectedActions.includes("CLICK_SUBMIT")) {
-    const submitText = findFirstMatchingText(combinedTexts, ["发布回答", "提交回答", "发布"]);
+    const submitText = findZhihuPublishLabel(actionTexts, "submit");
     if (submitText && hasEditorSemantic(snapshot)) {
       return {
         nextAction: "CLICK_SUBMIT",
@@ -1713,7 +1737,7 @@ function getExistingAnswerSignal(plan: PublishStepPlan): "view" | "edit" | null 
   }
 
   const combined = [...plan.targetTexts, ...plan.targetSelectors].join(" ");
-  if (combined.includes("查看我的回答") || combined.includes("我的回答")) {
+  if (normalizeZhihuPublishLabel(combined).includes(normalizeZhihuPublishLabel("查看我的回答"))) {
     return "view";
   }
 
@@ -1943,27 +1967,87 @@ function hasEditorSemantic(snapshot: PageSnapshot) {
 }
 
 function hasSubmitSemantic(snapshot: PageSnapshot) {
-  const combined = [snapshot.title, ...snapshot.visibleTexts, ...snapshot.buttons, ...snapshot.links.map((item) => item.text)].join(" ");
-  return SUBMIT_TEXT_CANDIDATES.some((text) => combined.includes(text));
+  return Boolean(findZhihuPublishLabel([...snapshot.buttons, ...snapshot.links.map((item) => item.text)], "submit"));
 }
 
 function isAnswerDetailUrl(url: string) {
-  return /\/answer\/\d+/i.test(url);
+  return /\/answer\/\d+(?:\/)?(?:[?#].*)?$/i.test(url);
+}
+
+export type QuestionLivenessResult = {
+  alive: boolean;
+  reason: string;
+  subType?: "not_found" | "closed" | "locked" | "deleted" | "blocked";
+};
+
+export function detectQuestionLiveness(snapshot: PageSnapshot): QuestionLivenessResult {
+  const url = snapshot.url || "";
+  const title = (snapshot.title || "").trim();
+  const visibleTexts = snapshot.visibleTexts || [];
+  const buttons = (snapshot.buttons || []).map((b) => b.trim());
+  const links = snapshot.links || [];
+  const textCorpus = [url, title, ...visibleTexts].join(" ");
+
+  const hasWriteAction =
+    buttons.some((b) => /(?:写回答|编辑回答|查看我的回答)/.test(b)) ||
+    links.some((l) => /(?:写回答|编辑回答|查看我的回答)/.test(l.text));
+
+  // 1. 明确的 404 URL 或标题
+  if (
+    url.includes("/404") ||
+    /^(?:404|页面不存在|知乎 - 页面不存在|你似乎来到了没有知识存在的荒原)/i.test(title)
+  ) {
+    return {
+      alive: false,
+      reason: "知乎页面不存在或已被删除（404/没有知识存在的荒原）。",
+      subType: "not_found"
+    };
+  }
+
+  // 2. 404 / 荒原 / 页面已删除 / 内容不存在（正文中出现且无写回答入口）
+  const is404Corpus = /(?:你似乎来到了没有知识存在的荒原|抱歉，您访问的页面不存在|页面不存在或已被删除|该内容已被删除|该问题已删除|找不到该页面)/i.test(textCorpus);
+  if (is404Corpus && !hasWriteAction) {
+    return {
+      alive: false,
+      reason: "知乎题目页面显示已删除或不存在（没有知识存在的荒原）。",
+      subType: "not_found"
+    };
+  }
+
+  // 3. 问题已关闭 / 已被锁定 / 暂不支持新回答
+  const isClosedOrLocked = /(?:该问题已关闭|问题已关闭|该问题已被锁定|问题已被锁定|当前问题暂不支持添加新回答|该问题暂不支持添加新回答|暂不支持添加回答)/i.test(textCorpus);
+  if (isClosedOrLocked && !hasWriteAction) {
+    return {
+      alive: false,
+      reason: "知乎问题已被关闭或锁定，不支持添加新回答。",
+      subType: "closed"
+    };
+  }
+
+  // 4. 知乎风控拦截 / 请求异常限制 (40362 / 暂时限制本次访问 / 安全验证)
+  const isBlockedOrRisk = /(?:40362|暂时限制本次访问|您当前请求存在异常|知乎小管家反馈|安全验证|系统检测到您的请求存在异常)/i.test(textCorpus);
+  if (isBlockedOrRisk && !hasWriteAction) {
+    return {
+      alive: false,
+      reason: "知乎反爬风控拦截或题目访问受限（40362/暂时限制本次访问/安全验证）。",
+      subType: "blocked"
+    };
+  }
+
+  return { alive: true, reason: "" };
+}
+
+function isLikelyUnavailablePage(snapshot: PageSnapshot) {
+  const liveness = detectQuestionLiveness(snapshot);
+  if (!liveness.alive) {
+    return true;
+  }
+  const leadingText = [snapshot.title, ...snapshot.visibleTexts.slice(0, 12)].join(" ");
+  return /(?:\b404\b|页面不存在|内容不存在|找不到该页面|page not found|not found)/i.test(leadingText);
 }
 
 function uniqueHttpUrls(urls: Array<string | null | undefined>) {
   return [...new Set(urls.filter((url): url is string => Boolean(url && /^https?:\/\//i.test(url))))];
-}
-
-function findFirstMatchingText(values: string[], candidates: string[]) {
-  for (const candidate of candidates) {
-    const matched = values.find((value) => value.includes(candidate));
-    if (matched) {
-      return matched;
-    }
-  }
-
-  return null;
 }
 
 function pickMyAnswerDetailUrl(snapshot: PageSnapshot, currentUrl: string) {
@@ -1990,7 +2074,11 @@ function sanitizeSubmitTargets(targetTexts: string[]) {
     .map((item) => item.trim())
     .filter(Boolean)
     .filter((item) => !/发布于|发表于|^\d{4}-\d{2}-\d{2}/.test(item))
-    .filter((item) => /发布回答|提交回答|发布/.test(item));
+    .filter((item) =>
+      ZHIHU_PUBLISH_LABELS.submit.some(
+        (candidate) => normalizeZhihuPublishLabel(item) === normalizeZhihuPublishLabel(candidate)
+      )
+    );
 }
 
 function compareExistingDraftToExpected(snapshot: PageSnapshot, expectedContent: string): ExistingDraftComparison {

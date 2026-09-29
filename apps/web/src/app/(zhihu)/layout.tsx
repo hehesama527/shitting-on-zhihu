@@ -13,6 +13,7 @@ export default function ZhihuProductLayout({ children }: Readonly<{ children: Re
         { href: "/zhihu/schedule", label: "排期" },
         { href: "/zhihu/topics", label: "选题 / 草稿" },
         { href: "/zhihu/publish-jobs", label: "发布任务" },
+        { href: "/zhihu/data-agent", label: "数据回收" },
         { href: "/zhihu/prompts", label: "提示词管理" },
         { href: "/zhihu/account", label: "账号" },
         { href: "/zhihu/ops", label: "运维" }

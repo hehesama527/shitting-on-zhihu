@@ -271,6 +271,31 @@ export class JobRepository {
     );
   }
 
+  async updateJobReviewLink(
+    jobId: number,
+    input: { topicCardId: number; reviewId: number; leaseOwner?: string | null }
+  ) {
+    await this.pool.query(
+      `UPDATE publish_jobs
+       SET topic_card_id = ?,
+           review_id = ?
+       WHERE id = ?
+         AND status NOT IN ('published', 'failed_terminal')
+         AND (
+           (? IS NOT NULL AND lease_owner = ? AND lease_until >= NOW())
+           OR (? IS NULL AND (lease_owner IS NULL OR lease_until < NOW()))
+         )`,
+      [
+        input.topicCardId,
+        input.reviewId,
+        jobId,
+        input.leaseOwner ?? null,
+        input.leaseOwner ?? null,
+        input.leaseOwner ?? null
+      ]
+    );
+  }
+
   async updateScheduledAt(jobId: number, scheduledAt: string | Date | null) {
     await this.pool.query(
       `UPDATE publish_jobs SET scheduled_at = ? WHERE id = ?`,
@@ -595,6 +620,25 @@ export class JobRepository {
       [now]
     );
     return rows.map(mapJobRow);
+  }
+
+  async getNextReviewPassedJobForAccount(accountId: number, excludeJobId?: number): Promise<JobListItem | null> {
+    const params: Array<number> = [accountId];
+    let excludeClause = "";
+    if (excludeJobId) {
+      excludeClause = "AND pj.id != ?";
+      params.push(excludeJobId);
+    }
+    const [rows] = await this.pool.query<JobRow[]>(
+      `${buildJobListSql()}
+       WHERE pj.account_id = ?
+         AND pj.status = 'review_passed'
+         ${excludeClause}
+       ORDER BY COALESCE(dps.scheduled_at, pj.scheduled_at, pj.created_at) ASC, pj.id ASC
+       LIMIT 1`,
+      params
+    );
+    return rows[0] ? mapJobRow(rows[0]) : null;
   }
 
   async listStaleRunningAttempts(olderThanMinutes = 30) {
